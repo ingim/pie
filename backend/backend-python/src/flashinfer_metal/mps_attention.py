@@ -9,9 +9,7 @@ from typing import Optional
 
 import torch
 
-from profiler import start_profile
-
-from .mps_config import (
+from mps_config import (
     DEBUG_ATOL,
     DEBUG_ENABLED,
     DEBUG_RTOL,
@@ -19,7 +17,7 @@ from .mps_config import (
     MPS_COMPILE_AVAILABLE,
     VERBOSITY_DETAILED,
 )
-from .mps_shader_compiler import BaseShaderCompiler
+from mps_shader_compiler import BaseShaderCompiler
 
 
 class AttentionCompiler(BaseShaderCompiler):
@@ -391,50 +389,45 @@ using namespace metal;
         #   - K cache: elements [0 ... page_size*kv_head_dim-1]
         #   - V cache: elements [page_size*kv_head_dim ... 2*page_size*kv_head_dim-1]
 
-        with start_profile("attn_kv_buffer_flatten"):
-            # Single unified KV cache buffer
-            # Ensure contiguous for optimal memory access
-            paged_kv_cache = kv_cache.contiguous().view(-1)
+        # Single unified KV cache buffer
+        # Ensure contiguous for optimal memory access
+        paged_kv_cache = kv_cache.contiguous().view(-1)
 
-        with start_profile("attn_query_flatten"):
-            # Reshape query for kernel:
-            # [num_tokens, num_heads, head_dim] -> 1D [num_tokens * num_heads * head_dim]
-            q_input = query.contiguous().view(-1)
+        # Reshape query for kernel:
+        # [num_tokens, num_heads, head_dim] -> 1D [num_tokens * num_heads * head_dim]
+        q_input = query.contiguous().view(-1)
 
         # Create debug buffer (optional, can be None)
         debug_out = torch.zeros(20, dtype=torch.float32, device="mps")
 
         # Launch the actual optimized kernel!
-        with start_profile("attn_metal_kernel"):
-            # Select kernel based on dtype: f32 for float32, fp16 for float16
-            if query.dtype == torch.float32:
-                kernel_name = "batch_prefill_attention_unified_f32_simdgroup_kernel"
-            else:
-                kernel_name = "batch_prefill_attention_unified_fp16_simdgroup_kernel"
+        # Select kernel based on dtype: f32 for float32, fp16 for float16
+        if query.dtype == torch.float32:
+            kernel_name = "batch_prefill_attention_unified_f32_simdgroup_kernel"
+        else:
+            kernel_name = "batch_prefill_attention_unified_fp16_simdgroup_kernel"
 
-            # Configure dispatch parameters
-            threads_per_threadgroup = 128
-            total_threads = num_tokens * threads_per_threadgroup
+        # Configure dispatch parameters
+        threads_per_threadgroup = 128
+        total_threads = num_tokens * threads_per_threadgroup
 
-            if not hasattr(lib, kernel_name):
-                raise RuntimeError(
-                    f"Kernel {kernel_name} not found in compiled library"
-                )
+        if not hasattr(lib, kernel_name):
+            raise RuntimeError(f"Kernel {kernel_name} not found in compiled library")
 
-            # Call the optimized simdgroup kernel with exact parameter layout and dispatch config
-            getattr(lib, kernel_name)(
-                q_input,  # q_input [buffer(0)]
-                paged_kv_cache,  # paged_kv_cache [buffer(1)] - unified KV cache
-                qo_indptr.to(torch.int32),  # qo_indptr [buffer(2)]
-                kv_page_indptr.to(torch.int32),  # kv_page_indptr [buffer(3)]
-                kv_page_indices.to(torch.int32),  # kv_page_indices [buffer(4)]
-                kv_last_page_lens.to(torch.int32),  # kv_last_page_lens [buffer(5)]
-                output,  # output [buffer(6)]
-                params,  # params [buffer(7)]
-                debug_out,  # debug_out [buffer(8)]
-                threads=(total_threads, 1, 1),
-                group_size=(threads_per_threadgroup, 1, 1),
-            )
+        # Call the optimized simdgroup kernel with exact parameter layout and dispatch config
+        getattr(lib, kernel_name)(
+            q_input,  # q_input [buffer(0)]
+            paged_kv_cache,  # paged_kv_cache [buffer(1)] - unified KV cache
+            qo_indptr.to(torch.int32),  # qo_indptr [buffer(2)]
+            kv_page_indptr.to(torch.int32),  # kv_page_indptr [buffer(3)]
+            kv_page_indices.to(torch.int32),  # kv_page_indices [buffer(4)]
+            kv_last_page_lens.to(torch.int32),  # kv_last_page_lens [buffer(5)]
+            output,  # output [buffer(6)]
+            params,  # params [buffer(7)]
+            debug_out,  # debug_out [buffer(8)]
+            threads=(total_threads, 1, 1),
+            group_size=(threads_per_threadgroup, 1, 1),
+        )
 
         # Output is already in correct 1D layout written by kernel
         # Kernel writes with stride (num_heads * head_dim) per token

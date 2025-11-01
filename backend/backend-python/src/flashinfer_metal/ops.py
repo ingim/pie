@@ -15,8 +15,8 @@ from typing import Any, Dict, Optional, Tuple
 
 import torch
 
-from ._internal.mps_shader_integration import get_mps_compiler
-from ._internal.pytorch_reference import (
+from mps_shader_integration import get_mps_compiler
+from pytorch_reference import (
     append_paged_kv_cache_reference,
     attention_reference,
     rope_reference,
