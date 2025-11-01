@@ -9,7 +9,7 @@ from typing import Optional
 
 import torch
 
-from mps_config import (
+from .mps_config import (
     DEBUG_ATOL,
     DEBUG_ENABLED,
     DEBUG_RTOL,
@@ -17,7 +17,7 @@ from mps_config import (
     MPS_COMPILE_AVAILABLE,
     VERBOSITY_DETAILED,
 )
-from mps_shader_compiler import BaseShaderCompiler
+from .mps_shader_compiler import BaseShaderCompiler
 
 
 class AttentionCompiler(BaseShaderCompiler):

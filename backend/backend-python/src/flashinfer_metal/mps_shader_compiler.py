@@ -10,7 +10,7 @@ from typing import Any, Dict
 
 import torch
 
-from mps_config import MPS_COMPILE_AVAILABLE, MPS_DEVICE_AVAILABLE
+from .mps_config import MPS_COMPILE_AVAILABLE, MPS_DEVICE_AVAILABLE
 
 
 class BaseShaderCompiler:

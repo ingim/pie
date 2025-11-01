@@ -17,7 +17,6 @@ import torch
 import message
 
 # Safe import of adapter functionality
-from adapter_utils import ensure_adapter_available
 from platform_detection import is_apple_silicon
 
 # Import profiler for performance analysis

@@ -9,9 +9,9 @@ from typing import Optional
 
 import torch
 
-from mps_append_kv_cache import AppendKVCacheCompiler
-from mps_attention import AttentionCompiler
-from mps_rope import RoPECompiler
+from .mps_append_kv_cache import AppendKVCacheCompiler
+from .mps_attention import AttentionCompiler
+from .mps_rope import RoPECompiler
 
 
 class MPSShaderCompiler:

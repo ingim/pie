@@ -1,11 +1,3 @@
-"""Shared server utilities for PIE backends.
-
-This module hosts the transport loop, registration logic, and configuration
-helpers that are agnostic to the underlying compute backend. Individual
-backends provide their own handler classes and model loading routines while
-reusing this shared infrastructure.
-"""
-
 from __future__ import annotations
 
 import enum
@@ -18,16 +10,12 @@ import queue
 import threading
 import time
 import traceback
-from pathlib import Path
-from typing import Any, Dict, Type
+from typing import Any
 
 import msgpack
 import msgspec
-import torch
 import zmq
 from websockets.sync.client import connect
-
-from profiler import initialize_memory_tracker
 
 from message import (
     DownloadAdapterRequest,
@@ -41,7 +29,7 @@ from message import (
     UploadAdapterRequest,
 )
 
-from model_loader import MetadataNotFoundError
+from .handler import Handler
 
 
 class HandlerId(enum.Enum):
@@ -58,104 +46,11 @@ class HandlerId(enum.Enum):
     DOWNLOAD_HANDLER = 8
 
 
-def resolve_cache_dir(cache_dir: str | None) -> str:
-    """Resolve the cache directory using CLI arg > env var > default.
-
-    - Windows: Uses %LOCALAPPDATA%/pie
-    - Unix (Linux, macOS, etc.): Uses ~/.cache/pie for Docker compatibility
-    """
-    if cache_dir:
-        return cache_dir
-
-    if "PIE_HOME" in os.environ:
-        return os.environ["PIE_HOME"]
-
-    # Platform-specific cache directory (matches C++ backend in utils.hpp)
-    if sys.platform == "win32":
-        # Windows: Use LOCALAPPDATA for cache (standard on Windows)
-        local_appdata = os.environ.get("LOCALAPPDATA")
-        if not local_appdata:
-            raise RuntimeError(
-                "Could not determine cache directory. "
-                "Please set %LOCALAPPDATA% or specify --cache-dir"
-            )
-        return str(Path(local_appdata) / "pie")
-    else:
-        # Unix (Linux, macOS): Use ~/.cache for Docker volume mount compatibility
-        home = Path.home()
-        return str(home / ".cache" / "pie")
-
-
-def build_config(**kwargs: Any) -> Dict[str, Any]:
-    """Normalize server configuration dictionary and resolve cache directory."""
-    config = {k: v for k, v in kwargs.items() if v is not None}
-
-    # Resolve the cache directory
-    config["cache_dir"] = resolve_cache_dir(config.get("cache_dir"))
-
-    # Check that either `max_num_kv_pages` or `gpu_mem_headroom` is set
-    if "max_num_kv_pages" not in config and "gpu_mem_headroom" not in config:
-        terminate(
-            "Config must contain either 'max_num_kv_pages' or 'gpu_mem_headroom'."
-        )
-
-    # Check that if `gpu_mem_headroom` is set, then CUDA must be available
-    if "gpu_mem_headroom" in config:
-        if not torch.cuda.is_available():
-            terminate("'gpu_mem_headroom' is set but CUDA is not available.")
-        if "cuda" not in config["device"]:
-            terminate("'gpu_mem_headroom' is set but device is not a CUDA device.")
-
-    return config
-
-
-def print_config(config: Dict[str, Any]) -> None:
-    """Utility to print configuration in a consistent format."""
-
-    print("--- Configuration ---")
-    for key, value in config.items():
-        print(f"{key}: {value}")
-    print("----------------------")
-
-
-def save_profiling_if_enabled(config: Dict[str, Any]) -> None:
-    """
-    DEPRECATED: Profiling is now handled by save_memory_profiling_if_enabled.
-    This function is kept for backward compatibility but does nothing.
-    """
-    _ = config  # Unused parameter kept for API compatibility
-
-
-def save_memory_profiling_if_enabled(config: Dict[str, Any]) -> None:
-    """Save unified profiling results if enabled."""
-    if not config.get("enable_profiling", False):
-        return
-
-    from profiler import get_memory_tracker  # pylint: disable=import-outside-toplevel
-
-    try:
-        tracker = get_memory_tracker()
-        tracker.stop()
-    except (OSError, ValueError, RuntimeError) as e:
-        print(f"⚠️  Failed to save profiling results: {e}")
-
-
 def start_service(
-    *,
-    config: Dict[str, Any],
-    handler_cls: Type,
+    config: dict[str, Any],
     register_with_controller: bool = True,
 ) -> None:
     """Spin up the backend service using the provided handler implementation."""
-
-    # Initialize profiler
-    enable_profiling = config.get("enable_profiling", False)
-
-    initialize_memory_tracker(
-        output_dir=".",
-        enabled=enable_profiling,
-        enable_timing=enable_profiling,
-    )
 
     if config["controller_host"] in ["127.0.0.1", "localhost"]:
         unique_id = random.randint(1000, 9999)
@@ -165,7 +60,7 @@ def start_service(
         endpoint = f"tcp://{config['host']}:{config['port']}"
         real_endpoint = f"tcp://*:{config['port']}"
 
-    handler = handler_cls(
+    handler = Handler(
         config=config,
     )
 
@@ -201,14 +96,17 @@ def start_service(
         args=(heartbeat_request_queue, response_queue, handler),
         daemon=True,
     ).start()
+
     threading.Thread(
         target=worker_thread,
         args=(work_request_queue, response_queue, handler),
         daemon=True,
     ).start()
+
     threading.Thread(
         target=zmq_response_thread, args=(response_queue, socket), daemon=True
     ).start()
+
     threading.Thread(
         target=zmq_listen_thread,
         args=(heartbeat_request_queue, work_request_queue, socket),
@@ -237,15 +135,12 @@ def start_service(
         # Block until shutdown signal
         shutdown_event.wait()
     finally:
-        # Save profiling results before shutdown if enabled
-        save_profiling_if_enabled(config)
-        save_memory_profiling_if_enabled(config)
         socket.close()
         context.term()
         print("Server shutdown complete.")
 
 
-def register_thread(config: Dict[str, Any], endpoint: str) -> None:
+def register_thread(config: dict[str, Any], endpoint: str) -> None:
     """Register this service with the controller."""
 
     controller_addr = f"ws://{config['controller_host']}:{config['controller_port']}"
@@ -471,109 +366,3 @@ def zmq_listen_thread(
         terminate(f"Unhandled error occurred in the ZMQ listen loop: {exc}")
     except Exception as exc:  # pylint: disable=broad-exception-caught
         terminate(f"Unhandled error occurred in the ZMQ listen loop: {exc}")
-
-
-def terminate(msg: str) -> None:
-    """Terminate the program with a message."""
-    print(f"\n[!!!] {msg} Terminating.", file=sys.stderr)
-    traceback.print_exc()
-    os._exit(1)
-
-
-# Main entry point for the server
-def main(
-    model: str,
-    host: str = "localhost",
-    port: int = 10123,
-    controller_host: str = "localhost",
-    controller_port: int = 9123,
-    internal_auth_token: str | None = None,
-    cache_dir: str | None = None,
-    kv_page_size: int = 16,
-    max_dist_size: int = 64,
-    max_num_embeds: int = 128,
-    max_batch_tokens: int = 10240,
-    max_num_adapters: int = 48,
-    max_adapter_rank: int = 8,
-    max_num_kv_pages: int | None = None,
-    gpu_mem_headroom: float | None = None,
-    device: str | None = None,
-    dtype: str = "bfloat16",
-    enable_profiling: bool = False,
-):
-    """
-    Runs the application with configuration provided as command-line arguments.
-
-    Args:
-        model: Name of the model to load (required).
-        host: Hostname for the ZMQ service to bind to.
-        port: Port for the ZMQ service to bind to.
-        controller_host: Hostname of the controller to register with.
-        controller_port: Port of the controller to register with.
-        internal_auth_token: Internal authentication token for connecting to the controller.
-        cache_dir: Directory for model cache. Defaults to PIE_HOME env var,
-                   then the platform-specific user cache dir.
-        kv_page_size: The size of each page in the key-value cache.
-        max_dist_size: Maximum distance for embeddings.
-        max_num_kv_pages: Maximum number of pages in the key-value cache.
-        max_num_embeds: Maximum number of embeddings to store.
-        max_batch_tokens: Maximum number of tokens in a batch.
-        max_num_adapters: Maximum number of adapters that can be loaded.
-        max_adapter_rank: Maximum rank for any loaded adapter.
-        device: The device to run the model on (e.g., 'mps', 'cuda:0', 'cpu').
-                Auto-detects to 'mps' on Apple Silicon, 'cuda:0' otherwise.
-        dtype: The data type for model weights (e.g., 'bfloat16', 'float16').
-        enable_profiling: Enable unified profiler (timing + tensor tracking) (default: False).
-    """
-    # Set PIE_METAL_PAGE_SIZE from config before importing handler
-    # This ensures metal_kernels.ops initializes with the correct page_size
-    os.environ["PIE_METAL_PAGE_SIZE"] = str(kv_page_size)
-
-    # Import here to avoid circular imports
-    # pylint: disable=import-outside-toplevel
-    from handler import Handler
-    from platform_detection import is_apple_silicon
-
-    # Auto-detect device if not specified
-    if device is None:
-        device = "mps" if is_apple_silicon() else "cuda:0"
-        print(f"Auto-detected device: {device}")
-
-    config = build_config(
-        model=model,
-        host=host,
-        port=port,
-        controller_host=controller_host,
-        controller_port=controller_port,
-        internal_auth_token=internal_auth_token,
-        cache_dir=cache_dir,
-        kv_page_size=kv_page_size,
-        max_dist_size=max_dist_size,
-        max_num_embeds=max_num_embeds,
-        max_batch_tokens=max_batch_tokens,
-        max_num_adapters=max_num_adapters,
-        max_adapter_rank=max_adapter_rank,
-        max_num_kv_pages=max_num_kv_pages,
-        gpu_mem_headroom=gpu_mem_headroom,
-        device=device,
-        dtype=dtype,
-        enable_profiling=enable_profiling,
-    )
-
-    print_config(config)
-
-    try:
-        start_service(
-            config=config,
-            handler_cls=Handler,
-        )
-    except MetadataNotFoundError as e:
-        print(f"Error: {e}")
-        print(f"Try `pie model add {e.model_name}` to download the model.")
-        os._exit(1)
-
-
-if __name__ == "__main__":
-    import fire
-
-    fire.Fire(main)

@@ -7,8 +7,8 @@ for PyTorch MPS backend.
 
 import torch
 
-from mps_config import MPS_COMPILE_AVAILABLE
-from mps_shader_compiler import BaseShaderCompiler
+from .mps_config import MPS_COMPILE_AVAILABLE
+from .mps_shader_compiler import BaseShaderCompiler
 
 
 class AppendKVCacheCompiler(BaseShaderCompiler):

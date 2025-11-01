@@ -6,8 +6,8 @@ for PyTorch MPS backend.
 """
 
 import torch
-from mps_shader_compiler import BaseShaderCompiler
-from mps_config import (
+from .mps_shader_compiler import BaseShaderCompiler
+from .mps_config import (
     MPS_COMPILE_AVAILABLE,
     DEBUG_ENABLED,
     DEBUG_ATOL,

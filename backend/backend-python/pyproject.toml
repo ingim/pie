@@ -1,5 +1,5 @@
 [project]
-name = "pie-backend"
+name = "pie-model-service"
 version = "0.1.0"
 description = "Pie Backend"
 authors = [{ name = "Pie Team" }]
@@ -28,7 +28,7 @@ cuda = [
 ]
 
 # macOS-specific dependencies for Metal backend debugging
-macos = [
+metal = [
     # Core PyObjC for Objective-C bridge (more stable than full PyObjC suite)
     "pyobjc-core>=10.0,<11.0",
     # Essential Metal framework bindings only
