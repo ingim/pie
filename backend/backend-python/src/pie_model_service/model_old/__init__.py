@@ -1,5 +1,3 @@
-"""Shared model loading utilities for PIE backends."""
-
 from __future__ import annotations
 
 import sys
@@ -12,7 +10,7 @@ import ztensor
 from tqdm import tqdm
 
 from model.config import ModelInfo
-from .config import ServiceConfig
+from ..config import ServiceConfig
 
 
 def load_model_info(config: ServiceConfig) -> ModelInfo:

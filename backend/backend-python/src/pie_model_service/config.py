@@ -1,11 +1,11 @@
-import sys
+from __future__ import annotations
+
 from dataclasses import dataclass, asdict
-from typing import Any
 from .utils import resolve_cache_dir, terminate
 
 
 @dataclass
-class ServerConfig:
+class ServiceConfig:
     """
     Configuration for the server, validated upon creation.
 
@@ -50,7 +50,7 @@ class ServerConfig:
         device: str | None = None,
         dtype: str = "bfloat16",
         enable_profiling: bool = False,
-    ) -> "ServerConfig":
+    ) -> ServiceConfig:
         """
         Factory method to build a validated and resolved ServerConfig.
         This replaces the original `build_config` logic.
@@ -95,38 +95,3 @@ class ServerConfig:
         for key, value in asdict(self).items():
             print(f"{key}: {value}")
         print("----------------------")
-
-
-# --- Example Usage ---
-
-if __name__ == "__main__":
-
-    print("--- 1. Creating a valid config ---")
-    try:
-        # The main() logic is now replaced by calling the factory method
-        config = ServerConfig.from_args(
-            model="my-cool-model",
-            max_num_kv_pages=1024,  # Satisfies the validation rule
-            device="cuda:0",
-            internal_auth_token="my-secret-token",
-        )
-
-        # The print_config() function is now a method
-        config.print()
-
-        # You can access properties directly
-        print(f"\nModel is: {config.model}")
-        print(f"Cache dir is: {config.cache_dir}")
-
-    except ValueError as e:
-        print(f"Configuration failed: {e}")
-
-    print("\n--- 2. Creating an invalid config (to test validation) ---")
-    try:
-        # This will fail the validation check
-        invalid_config = ServerConfig.from_args(
-            model="my-bad-model"
-            # Missing max_num_kv_pages AND gpu_mem_headroom
-        )
-    except ValueError as e:
-        print(f"Configuration correctly failed as expected.")

@@ -1,5 +1,4 @@
 from __future__ import annotations
-
 import enum
 import os
 import random
@@ -9,15 +8,13 @@ import sys
 import queue
 import threading
 import time
-import traceback
 from typing import Any
-
 import msgpack
 import msgspec
 import zmq
 from websockets.sync.client import connect
 
-from message import (
+from .message import (
     DownloadAdapterRequest,
     EmbedImageRequest,
     ForwardPassRequest,
@@ -30,6 +27,8 @@ from message import (
 )
 
 from .handler import Handler
+from .config import ServiceConfig
+from .utils import terminate
 
 
 class HandlerId(enum.Enum):
@@ -47,26 +46,20 @@ class HandlerId(enum.Enum):
 
 
 def start_service(
-    config: dict[str, Any],
-    register_with_controller: bool = True,
-) -> None:
+    config: ServiceConfig,
+):
     """Spin up the backend service using the provided handler implementation."""
 
-    if config["controller_host"] in ["127.0.0.1", "localhost"]:
-        unique_id = random.randint(1000, 9999)
-        endpoint = f"ipc:///tmp/pie-service-{unique_id}"
-        real_endpoint = endpoint
-    else:
-        endpoint = f"tcp://{config['host']}:{config['port']}"
-        real_endpoint = f"tcp://*:{config['port']}"
+    unique_id = random.randint(1000, 9999)
+    endpoint = f"ipc:///tmp/pie-model-service-{unique_id}"
 
     handler = Handler(
-        config=config,
+        config,
     )
 
     context = zmq.Context()
     socket = context.socket(zmq.ROUTER)
-    socket.bind(real_endpoint)
+    socket.bind(endpoint)
 
     heartbeat_request_queue = queue.Queue()
     work_request_queue = queue.Queue()
@@ -113,12 +106,11 @@ def start_service(
         daemon=True,
     ).start()
 
-    if register_with_controller:
-        threading.Thread(
-            target=register_thread,
-            args=(config, endpoint),
-            daemon=True,
-        ).start()
+    threading.Thread(
+        target=register_thread,
+        args=(config, endpoint),
+        daemon=True,
+    ).start()
 
     # Setup shutdown flag and signal handlers
     shutdown_event = threading.Event()
@@ -140,22 +132,24 @@ def start_service(
         print("Server shutdown complete.")
 
 
-def register_thread(config: dict[str, Any], endpoint: str) -> None:
+def register_thread(config: ServiceConfig, endpoint: str) -> None:
     """Register this service with the controller."""
 
-    controller_addr = f"ws://{config['controller_host']}:{config['controller_port']}"
+    controller_addr = f"ws://{config.host}:{config.port}"
     try:
         with connect(controller_addr) as websocket:
             auth_msg = msgpack.packb(
                 {
                     "type": "internal_authenticate",
                     "corr_id": 0,
-                    "token": config["internal_auth_token"],
+                    "token": config.internal_auth_token,
                 },
                 use_bin_type=True,
             )
+
             if auth_msg is not None:
                 websocket.send(auth_msg)
+
             auth_response = msgpack.unpackb(websocket.recv(), raw=False)
             if not auth_response.get("successful"):
                 print(
@@ -168,13 +162,14 @@ def register_thread(config: dict[str, Any], endpoint: str) -> None:
                     "type": "attach_remote_service",
                     "corr_id": 0,
                     "endpoint": endpoint,
-                    "service_name": config["model"],
+                    "service_name": config.model,
                     "service_type": "model",
                 },
                 use_bin_type=True,
             )
             if reg_msg is not None:
                 websocket.send(reg_msg)
+
             reg_response = msgpack.unpackb(websocket.recv(), raw=False)
             if not reg_response.get("successful"):
                 print(
@@ -185,13 +180,14 @@ def register_thread(config: dict[str, Any], endpoint: str) -> None:
             print(f"Registered with controller at {controller_addr}")
 
     except (ConnectionRefusedError, TimeoutError) as exc:
-        print(f"Failed to connect to the controller at {controller_addr}.")
-        print(f"Error: {exc}")
-        print("Please ensure the controller is running and accessible. Terminating.")
-        os._exit(1)
+        terminate(
+            f"Failed to connect to the controller at {controller_addr}. Error: {exc}"
+        )
+
     except (OSError, ValueError, RuntimeError) as exc:
-        print(f"An unexpected error occurred during registration: {exc}. Terminating.")
-        os._exit(1)
+        terminate(
+            f"An unexpected error occurred during registration: {exc}. Terminating."
+        )
 
 
 def heartbeat_thread(
@@ -200,7 +196,7 @@ def heartbeat_thread(
     """Heartbeat thread that responds to heartbeat requests to the controller. And if no
     heartbeat is received for the timeout period, terminates the program."""
 
-    heartbeat_timeout = 15
+    heartbeat_timeout = 15.0
     last_heartbeat_time = time.monotonic()
 
     try:

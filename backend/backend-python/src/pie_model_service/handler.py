@@ -15,70 +15,46 @@ import numpy as np
 import torch
 
 import message
-
-# Safe import of adapter functionality
-from platform_detection import is_apple_silicon
-
-# Import profiler for performance analysis
-from profiler import start_profile
-
-# Module-level constant for backend detection
-BACKEND_NAME: str
+from .config import ServiceConfig
+from .utils import is_apple_silicon
 
 # Direct import of backend operations based on platform
 # metal_kernels now provides the same API structure as flashinfer
 if is_apple_silicon():
-    try:
-        import metal_kernels.ops as ops  # type: ignore[import-not-found]
-
-        BACKEND_NAME = "metal_kernels"
-    except ImportError:
-        ops = None  # type: ignore[assignment]
-        BACKEND_NAME = "metal_kernels (unavailable)"
+    import flashinfer_metal as ops  # type: ignore[import-not-found]
 else:
-    try:
-        import flashinfer as ops  # type: ignore[import-not-found]
-
-        BACKEND_NAME = "flashinfer"
-    except ImportError:
-        ops = None  # type: ignore[assignment]
-        BACKEND_NAME = "flashinfer (unavailable)"
+    import flashinfer as ops  # type: ignore[import-not-found]
 
 
 class Handler:
     """Python backend handler using platform-appropriate operations."""
 
-    max_num_kv_pages: int
-    max_num_embeds: int
-    max_num_adapters: int
-    max_adapter_rank: int
+    # max_num_kv_pages: int
+    # max_num_embeds: int
+    # max_num_adapters: int
+    # max_adapter_rank: int
 
     def __init__(
         self,
-        config: dict,
+        config: ServiceConfig,
     ):
         """Initialize handler with platform-appropriate backend operations."""
         self.adapters = {}
-        self.ops = ops  # backend operations module (flashinfer or pie_metal.ops)
         self.config = config  # Store config for later use
 
-        print(f"✅ Handler initialized with {BACKEND_NAME} backend")
+        self.lm, self.model_info = load_model(
+            config,
+        )
 
-        # Put imports here to avoid circular import
-        # pylint: disable=import-outside-toplevel
-        from model_loader import load_model, load_model_info
-        from model_factory import create_model_and_fusion_map
-
-        self.model_info = load_model_info(config)
-        self.kv_page_size = config["kv_page_size"]
-        self.max_dist_size = config["max_dist_size"]
-        self.max_num_embeds = config["max_num_embeds"]
-        self.max_batch_tokens = config["max_batch_tokens"]
-        self.max_num_adapters = config["max_num_adapters"]
-        self.max_adapter_rank = config["max_adapter_rank"]
-        self.dtype = getattr(torch, config["dtype"])
-        self.device = config["device"]
-        self.logits_dtype = getattr(torch, config["dtype"])
+        # self.kv_page_size = config["kv_page_size"]
+        # self.max_dist_size = config["max_dist_size"]
+        # self.max_num_embeds = config["max_num_embeds"]
+        # self.max_batch_tokens = config["max_batch_tokens"]
+        # self.max_num_adapters = config["max_num_adapters"]
+        # self.max_adapter_rank = config["max_adapter_rank"]
+        # self.dtype = getattr(torch, config["dtype"])
+        # self.device = config["device"]
+        # self.logits_dtype = getattr(torch, config["dtype"])
 
         # If `gpu_mem_headroom` is set by the user, then we will cap the KV
         # cache size so that there is some percentage of GPU memory left over
@@ -94,18 +70,17 @@ class Handler:
         # which may lead to fragmentation and out-of-memory errors if big
         # tensors are not allocated up front.
         if not adaptive_kv_cache_size:
-            self.max_num_kv_pages = config["max_num_kv_pages"]
             self.kv_cache_at_layer = [
                 torch.zeros(
                     (
-                        self.max_num_kv_pages,
+                        config.max_num_kv_pages,
                         2,
-                        self.kv_page_size,
+                        config.kv_page_size,
                         self.model_info.architecture.num_key_value_heads,
                         self.model_info.architecture.head_size,
                     ),
-                    dtype=self.dtype,
-                    device=self.device,
+                    dtype=config.dtype,
+                    device=config.device,
                 )
                 for _ in range(self.model_info.architecture.num_layers)
             ]
@@ -143,24 +118,6 @@ class Handler:
             )
             for _ in range(self.model_info.architecture.num_layers)
         ]
-
-        self.lm = load_model(
-            config,
-            self.model_info,
-            create_model_and_fusion_map,
-        )
-
-        # Validate model structure has required attributes and they are callable
-        if not hasattr(self.lm, "lm_head"):
-            raise AttributeError("Loaded model is missing required 'lm_head' attribute")
-        if not callable(self.lm.lm_head):  # type: ignore[attr-defined]
-            raise TypeError("Model 'lm_head' attribute must be callable")
-        if not hasattr(self.lm, "model"):
-            raise AttributeError("Loaded model is missing required 'model' attribute")
-        if not hasattr(self.lm.model, "embed_tokens"):  # type: ignore[attr-defined]
-            raise AttributeError("Model is missing required 'embed_tokens' method")
-        if not callable(self.lm.model.embed_tokens):  # type: ignore[attr-defined]
-            raise TypeError("Model 'embed_tokens' attribute must be callable")
 
         # If `gpu_mem_headroom` is set by the user, then we have to allocate the KV
         # cache at the end and dynamically calculate the number of KV pages based on

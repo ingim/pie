@@ -25,9 +25,11 @@ class Config:
     hidden_size: int
     intermediate_size: int
     vocab_size: int
-    use_qkv_bias: bool
     rms_norm_eps: float
 
+    rope_factor: float
+    rope_high_frequency_factor: float
+    rope_low_frequency_factor: float
     rope_theta: float
 
     @staticmethod
@@ -42,6 +44,9 @@ class Config:
             intermediate_size=int(config["intermediate_size"]),
             vocab_size=int(config["vocab_size"]),
             rms_norm_eps=float(config["rms_norm_eps"]),
+            rope_factor=float(config["rope"]["factor"]),
+            rope_high_frequency_factor=float(config["rope"]["high_frequency_factor"]),
+            rope_low_frequency_factor=float(config["rope"]["low_frequency_factor"]),
             rope_theta=float(config["rope"]["theta"]),
         )
 
@@ -53,10 +58,8 @@ def prepare_params(
     Modifies the weights dictionary in-place to fuse tensors.
 
     This function applies the fusion rules derived from the v1 model structure:
-    1. Fuses Q, K, V weights into a single 'qkv_proj' tensor.
+    1. Fuses Q, K, V weights and biases into a single 'qkv_proj' tensor.
     2. Fuses 'gate_proj' and 'up_proj' weights into 'gate_up_proj'.
-
-    Note: Qwen3 0.6B model does not use biases in these projections.
     """
     # Find all layer indices present in the weights
     layer_indices = set()
@@ -69,13 +72,11 @@ def prepare_params(
     for layer_idx in sorted(list(layer_indices)):
         prefix = f"model.layers.{layer_idx}"
 
-        # Fuse QKV weights
         q = params.pop(f"{prefix}.self_attn.q_proj.weight")
         k = params.pop(f"{prefix}.self_attn.k_proj.weight")
         v = params.pop(f"{prefix}.self_attn.v_proj.weight")
         params[f"{prefix}.self_attn.qkv_proj.weight"] = torch.cat([q, k, v], dim=0)
 
-        # Fuse MLP weights
         gate = params.pop(f"{prefix}.mlp.gate_proj.weight")
         up = params.pop(f"{prefix}.mlp.up_proj.weight")
         params[f"{prefix}.mlp.gate_up_proj.weight"] = torch.cat([gate, up], dim=0)
@@ -118,6 +119,7 @@ class ForwardPass:
         # subpasses
         adapter_subpass: Optional[AdapterSubpass],
     ):
+
         hidden_states = input_embeds
         n, _ = hidden_states.size()
 
@@ -147,7 +149,7 @@ class ForwardPass:
                 head_dim=config.head_size,
                 page_size=page_size,
                 pos_encoding_mode="NONE",
-                q_data_type=config.dtype,
+                q_data_type=input_embeds.dtype,
             )
         else:
             wrapper = self.wrapper_append
@@ -161,7 +163,7 @@ class ForwardPass:
                 head_dim_qk=config.head_size,
                 page_size=page_size,
                 custom_mask=custom_mask,
-                q_data_type=config.dtype,
+                q_data_type=input_embeds.dtype,
             )
 
         for layer_idx in range(config.num_layers):
@@ -212,29 +214,18 @@ class ForwardPass:
             k = k.view(n, config.num_key_value_heads, config.head_size)
             v = v.view(n, config.num_key_value_heads, config.head_size)
 
-            # 5. QK Normalization (Qwen3 specific)
-            q = fun.rms_norm(
-                q,
-                normalized_shape=[config.head_size],
-                weight=params[f"model.layers.{layer_idx}.self_attn.q_norm.weight"],
-                eps=config.rms_norm_eps,
-            )
-            k = fun.rms_norm(
-                k,
-                normalized_shape=[config.head_size],
-                weight=params[f"model.layers.{layer_idx}.self_attn.k_norm.weight"],
-                eps=config.rms_norm_eps,
-            )
-
-            # 6. Apply RoPE (in-place)
-            ops.apply_rope_pos_ids_inplace(
+            # 5. Apply RoPE (in-place)
+            ops.apply_llama31_rope_pos_ids_inplace(
                 q=q,
                 k=k,
                 pos_ids=position_ids,
+                rope_scale=config.rope_factor,
                 rope_theta=config.rope_theta,
+                low_freq_factor=config.rope_low_frequency_factor,
+                high_freq_factor=config.rope_high_frequency_factor,
             )
 
-            # 7. Append K, V to cache
+            # 6. Append K, V to cache
             ops.append_paged_kv_cache(
                 append_key=k,
                 append_value=v,
@@ -249,13 +240,13 @@ class ForwardPass:
             # K and V are now in the cache, no longer needed in flight
             del k, v
 
-            # 8. Compute Attention
+            # 7. Compute Attention
             attn_output = wrapper.run(q, kv_cache_at_layer[layer_idx])
             del q  # Q is no longer needed
 
             attn_output = attn_output.reshape(n, -1)
 
-            # 9. Output Projection
+            # 8. Output Projection
             attn_proj = fun.linear(
                 attn_output,
                 weight=params[f"model.layers.{layer_idx}.self_attn.o_proj.weight"],
@@ -264,7 +255,7 @@ class ForwardPass:
             del attn_output
             ### END SELF_ATTN
 
-            # 10. First Residual Connection
+            # 9. First Residual Connection
             hidden_states = residual + attn_proj
             # Free the original input and the attention projection
             del residual, attn_proj
@@ -272,7 +263,7 @@ class ForwardPass:
             # Save result of first add for the second residual connection
             residual = hidden_states
 
-            # 11. Post-Attention RMSNorm
+            # 10. Post-Attention RMSNorm
             normed_mlp_input = fun.rms_norm(
                 hidden_states,
                 normalized_shape=[config.hidden_size],
@@ -283,7 +274,7 @@ class ForwardPass:
             )
 
             ### BEGIN MLP
-            # 12. Gate/Up Projection
+            # 11. Gate/Up Projection
             gate_up = fun.linear(
                 normed_mlp_input,
                 weight=params[f"model.layers.{layer_idx}.mlp.gate_up_proj.weight"],
@@ -295,11 +286,11 @@ class ForwardPass:
             gate, up = gate_up.chunk(2, dim=-1)
             del gate_up  # Free fused tensor
 
-            # 13. SiLU Activation & Gating
+            # 12. SiLU Activation & Gating
             interim_state = fun.silu(gate) * up
             del gate, up
 
-            # 14. Down Projection
+            # 13. Down Projection
             mlp_output = fun.linear(
                 interim_state,
                 weight=params[f"model.layers.{layer_idx}.mlp.down_proj.weight"],
@@ -308,7 +299,7 @@ class ForwardPass:
             del interim_state
             ### END MLP
 
-            # 15. Second Residual Connection
+            # 14. Second Residual Connection
             hidden_states = residual + mlp_output
             # Free the mid-block tensor and the mlp output
             del residual, mlp_output

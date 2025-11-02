@@ -1,326 +1,102 @@
-"""Qwen 2 Large Language Model Architecture (Qwen2)"""
-
 from __future__ import annotations
-from dataclasses import dataclass
+
+import dataclasses
 from typing import Optional
 
 import torch
-from torch import nn
+import torch.nn.functional as fun
 
-from adapter_utils import AdapterSubpass
-from model.config import CommonArch, ModelConfig
-import flashinfer as ops
+from src.pie_model_service.adapter import AdapterSubpass
+from src.pie_model_service.utils import is_apple_silicon
 
-VERSION = "0.1.0"
+if is_apple_silicon():
+    import flashinfer_metal as ops  # type: ignore[import-not-found]
+else:
+    import flashinfer as ops  # type: ignore[import-not-found,no-redef]
 
 
-@dataclass
-class Qwen2Arch(CommonArch):
-    """Qwen2 specific architecture configuration."""
-
+@dataclasses.dataclass
+class Config:
+    type: str
+    num_layers: int
+    num_query_heads: int
+    num_key_value_heads: int
+    head_size: int
+    hidden_size: int
+    intermediate_size: int
+    vocab_size: int
+    use_qkv_bias: bool
+    rms_norm_eps: float
     rope_theta: float
 
     @staticmethod
-    def from_config(cfg: ModelConfig) -> "Qwen2Arch":
-        """Parse Qwen2-specific architecture configuration."""
-        # Get common architecture fields
-        common_arch_dict = cfg.get_common_arch_dict()
-
-        # Get all the fields for the architecture section to grab other
-        # architecture-specific fields
-        arch_dict = cfg.get_required_key(cfg.root, "architecture")
-
-        # Get RoPE configuration
-        rope_dict = cfg.get_required_key(arch_dict, "rope")
-        rope_theta = cfg.get_required_key(rope_dict, "theta")
-
-        return Qwen2Arch(
-            # Common fields
-            **common_arch_dict,
-            # Qwen2-specific fields
-            rope_theta=rope_theta,
+    def from_dict(config: dict) -> Config:
+        return Config(
+            type=config["type"],
+            num_layers=int(config["num_layers"]),
+            num_query_heads=int(config["num_query_heads"]),
+            num_key_value_heads=int(config["num_key_value_heads"]),
+            head_size=int(config["head_size"]),
+            hidden_size=int(config["hidden_size"]),
+            intermediate_size=int(config["intermediate_size"]),
+            vocab_size=int(config["vocab_size"]),
+            rms_norm_eps=float(config["rms_norm_eps"]),
+            rope_theta=float(config["rope"]["theta"]),
         )
 
 
-def create_fusion_map(model: nn.Module):
+def prepare_params(
+    params: dict[str, torch.Tensor],
+):
     """
-    Analyzes the model and creates a map for fusing weights.
+    Modifies the weights dictionary in-place to fuse tensors.
 
-    Returns:
-        A dictionary mapping {fused_tensor_name: {"sources": [source_names], "dim": cat_dim}}.
+    This function applies the fusion rules derived from the v1 model structure:
+    1. Fuses Q, K, V weights and biases into a single 'qkv_proj' tensor.
+    2. Fuses 'gate_proj' and 'up_proj' weights into 'gate_up_proj'.
     """
-    fusion_map = {}
-    for name, module in model.named_modules():
-        # --- Rule for Qwen2Attention QKV Fusion ---
-        if isinstance(module, Qwen2Attention):
-            # Handle weights
-            target_w = f"{name}.qkv_proj.weight"
-            sources_w = [
-                f"{name}.q_proj.weight",
-                f"{name}.k_proj.weight",
-                f"{name}.v_proj.weight",
-            ]
-            fusion_map[target_w] = {"sources": sources_w, "dim": 0, "op": "fusion"}
+    # Find all layer indices present in the weights
+    layer_indices = set()
+    for key in params.keys():
+        parts = key.split(".")
+        # Check for 'model.layers.{idx}.*'
+        if len(parts) > 3 and parts[0] == "model" and parts[1] == "layers":
+            layer_indices.add(int(parts[2]))
 
-            # Handle biases if they exist
-            if module.qkv_proj.bias is not None:
-                target_b = f"{name}.qkv_proj.bias"
-                sources_b = [
-                    f"{name}.q_proj.bias",
-                    f"{name}.k_proj.bias",
-                    f"{name}.v_proj.bias",
-                ]
-                fusion_map[target_b] = {"sources": sources_b, "dim": 0, "op": "fusion"}
+    for layer_idx in sorted(list(layer_indices)):
+        prefix = f"model.layers.{layer_idx}"
 
-        # --- Rule for Qwen2Mlp Gate/Up Fusion ---
-        elif isinstance(module, Qwen2Mlp):
-            # Handle weights
-            target_w = f"{name}.gate_up_proj.weight"
-            sources_w = [f"{name}.gate_proj.weight", f"{name}.up_proj.weight"]
-            fusion_map[target_w] = {"sources": sources_w, "dim": 0, "op": "fusion"}
+        # Fuse QKV weights
+        q = params.pop(f"{prefix}.self_attn.q_proj.weight")
+        k = params.pop(f"{prefix}.self_attn.k_proj.weight")
+        v = params.pop(f"{prefix}.self_attn.v_proj.weight")
+        params[f"{prefix}.self_attn.qkv_proj.weight"] = torch.cat([q, k, v], dim=0)
 
-            # Handle biases (Qwen2 typically doesn't use bias in MLP layers)
-            if hasattr(module, "gate_up_proj") and module.gate_up_proj.bias is not None:
-                target_b = f"{name}.gate_up_proj.bias"
-                sources_b = [f"{name}.gate_proj.bias", f"{name}.up_proj.bias"]
-                fusion_map[target_b] = {"sources": sources_b, "dim": 0, "op": "fusion"}
-
-    return fusion_map
-
-
-class Qwen2Mlp(nn.Module):
-    """Qwen2 MLP layer with SiLU activation function."""
-
-    def __init__(self, config: Qwen2Arch):
-        """Initialize the Qwen2 MLP layer."""
-        super().__init__()
-        self.config = config
-        self.gate_up_proj = nn.Linear(
-            config.hidden_size,
-            2 * config.intermediate_size,
-            bias=False,
-            device=config.device,
-            dtype=config.dtype,
-        )
-        self.down_proj = nn.Linear(
-            config.intermediate_size,
-            config.hidden_size,
-            bias=False,
-            device=config.device,
-            dtype=config.dtype,
-        )
-        self.act_fn = nn.SiLU()
-
-    def forward(self, x):
-        """Forward pass through the MLP layer."""
-        gate_up_proj_out = self.gate_up_proj(x)
-        gate_proj, up_proj = gate_up_proj_out.chunk(2, dim=-1)
-
-        interim = self.act_fn(gate_proj) * up_proj
-
-        down_proj = self.down_proj(interim)
-        return down_proj
-
-
-class Qwen2Attention(nn.Module):
-    """Qwen2 attention module with FlashInfer support and Grouped Query Attention."""
-
-    def __init__(self, config: Qwen2Arch, layer_idx: int):
-        """Initialize the Qwen2 attention module."""
-        super().__init__()
-        self.config = config
-        self.layer_idx = layer_idx
-
-        # Define the output sizes for Q, K, and V for clarity
-        self.q_size = config.num_query_heads * config.head_size
-        self.k_size = config.num_key_value_heads * config.head_size
-        self.v_size = config.num_key_value_heads * config.head_size
-
-        self.qkv_proj = nn.Linear(
-            config.hidden_size,
-            self.q_size + self.k_size + self.v_size,
-            bias=config.use_qkv_bias,
-            device=config.device,
-            dtype=config.dtype,
+        # Qwen2 uses QKV bias, so fuse them
+        q_bias = params.pop(f"{prefix}.self_attn.q_proj.bias")
+        k_bias = params.pop(f"{prefix}.self_attn.k_proj.bias")
+        v_bias = params.pop(f"{prefix}.self_attn.v_proj.bias")
+        params[f"{prefix}.self_attn.qkv_proj.bias"] = torch.cat(
+            [q_bias, k_bias, v_bias], dim=0
         )
 
-        self.o_proj = nn.Linear(
-            config.num_query_heads * config.head_size,
-            config.hidden_size,
-            bias=False,
-            device=config.device,
-            dtype=config.dtype,
-        )
+        # Fuse MLP weights
+        gate = params.pop(f"{prefix}.mlp.gate_proj.weight")
+        up = params.pop(f"{prefix}.mlp.up_proj.weight")
+        params[f"{prefix}.mlp.gate_up_proj.weight"] = torch.cat([gate, up], dim=0)
 
-    def forward(
-        self,
-        wrapper,
-        hidden_states: torch.Tensor,
-        position_ids: torch.Tensor,
-        kv_cache_at_layer: torch.Tensor,
-        kv_page_indices: torch.Tensor,
-        kv_page_indptr: torch.Tensor,
-        kv_last_page_lens: torch.Tensor,
-        batch_indices: torch.Tensor,
-        batch_positions: torch.Tensor,
-        adapter_subpass: Optional[AdapterSubpass],
-    ) -> torch.Tensor:
-        """Forward pass through the attention module."""
-
-        n, _ = hidden_states.size()
-
-        qkv_states = self.qkv_proj(hidden_states)
-        query_states, key_states, value_states = torch.split(
-            qkv_states, [self.q_size, self.k_size, self.v_size], dim=-1
-        )
-
-        # apply adapters if provided
-        if adapter_subpass is not None:
-            adapter_subpass.execute(
-                self.layer_idx,
-                hidden_states,
-                q_state=query_states,
-                k_state=key_states,
-                v_state=value_states,
-            )
-
-        query_states = query_states.view(
-            n, self.config.num_query_heads, self.config.head_size
-        )
-        key_states = key_states.view(
-            n, self.config.num_key_value_heads, self.config.head_size
-        )
-        value_states = value_states.view(
-            n, self.config.num_key_value_heads, self.config.head_size
-        )
-
-        ops.apply_rope_pos_ids_inplace(
-            q=query_states,
-            k=key_states,
-            pos_ids=position_ids,
-            rope_theta=self.config.rope_theta,
-        )
-
-        ops.append_paged_kv_cache(
-            append_key=key_states,
-            append_value=value_states,
-            batch_indices=batch_indices,
-            positions=batch_positions,
-            paged_kv_cache=kv_cache_at_layer[self.layer_idx],
-            kv_indices=kv_page_indices,
-            kv_indptr=kv_page_indptr,
-            kv_last_page_len=kv_last_page_lens,
-            kv_layout="NHD",
-        )
-
-        attn_output = wrapper.run(query_states, kv_cache_at_layer[self.layer_idx])
-        attn_output = attn_output.reshape(n, -1)
-
-        attn_output = self.o_proj(attn_output)
-
-        return attn_output
+        # Qwen2 MLP does not use bias, so no bias fusion is needed here.
 
 
-class Qwen2DecoderLayer(nn.Module):
-    """Qwen2 decoder layer."""
+class ForwardPass:
 
-    def __init__(self, config: Qwen2Arch, layer_idx: int):
-        """Initialize the Qwen2 decoder layer."""
-        super().__init__()
+    workspace_buffer: torch.Tensor
+    wrapper_decode: ops.BatchDecodeWithPagedKVCacheWrapper
+    wrapper_append: ops.BatchPrefillWithPagedKVCacheWrapper
 
-        self.self_attn = Qwen2Attention(config, layer_idx)
-
-        self.layer_idx = layer_idx
-
-        self.mlp = Qwen2Mlp(config)
-        self.input_layernorm = nn.RMSNorm(
-            config.hidden_size,
-            eps=config.rms_norm_eps,
-            device=config.device,
-            dtype=config.dtype,
-        )
-        self.post_attention_layernorm = nn.RMSNorm(
-            config.hidden_size,
-            eps=config.rms_norm_eps,
-            device=config.device,
-            dtype=config.dtype,
-        )
-
-    def forward(
-        self,
-        wrapper,
-        hidden_states: torch.Tensor,
-        position_ids: torch.Tensor,
-        kv_cache_at_layer: torch.Tensor,
-        kv_page_indices: torch.Tensor,
-        kv_page_indptr: torch.Tensor,
-        kv_last_page_lens: torch.Tensor,
-        batch_indices: torch.Tensor,
-        batch_positions: torch.Tensor,
-        adapter_subpass: Optional[AdapterSubpass],
-    ) -> torch.Tensor:
-        """Forward pass through the decoder layer."""
-        residual = hidden_states
-
-        hidden_states = self.input_layernorm(hidden_states)
-
-        # Self Attention
-        hidden_states = self.self_attn(
-            wrapper=wrapper,
-            hidden_states=hidden_states,
-            position_ids=position_ids,
-            kv_cache_at_layer=kv_cache_at_layer,
-            kv_page_indices=kv_page_indices,
-            kv_page_indptr=kv_page_indptr,
-            kv_last_page_lens=kv_last_page_lens,
-            batch_indices=batch_indices,
-            batch_positions=batch_positions,
-            adapter_subpass=adapter_subpass,
-        )
-
-        hidden_states = residual + hidden_states
-
-        # Fully Connected
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
-
-        hidden_states = self.mlp(hidden_states)
-
-        hidden_states = residual + hidden_states
-
-        return hidden_states
-
-
-class Qwen2Model(nn.Module):
-    """Qwen2 model with FlashInfer support."""
-
-    def __init__(self, config: Qwen2Arch):
-        """Initialize the Qwen2 model."""
-        super().__init__()
-        self.config = config
-
-        self.embed_tokens = nn.Embedding(
-            config.vocab_size,
-            config.hidden_size,
-            padding_idx=0,
-            device=config.device,
-            dtype=config.dtype,
-        )
-        self.layers = nn.ModuleList(
-            [
-                Qwen2DecoderLayer(config, layer_idx)
-                for layer_idx in range(config.num_layers)
-            ]
-        )
-        self.norm = nn.RMSNorm(
-            config.hidden_size,
-            eps=config.rms_norm_eps,
-            device=config.device,
-            dtype=config.dtype,
-        )
-
+    def __init__(self, device: torch.device):
         self.workspace_buffer = torch.empty(
-            128 * 1024 * 1024, dtype=torch.uint8, device=config.device
+            128 * 1024 * 1024, dtype=torch.uint8, device=device
         )
         self.wrapper_decode = ops.BatchDecodeWithPagedKVCacheWrapper(
             self.workspace_buffer, "NHD"
@@ -329,106 +105,203 @@ class Qwen2Model(nn.Module):
             self.workspace_buffer, "NHD"
         )
 
-    def forward(
+    @torch.inference_mode()
+    def execute(
         self,
+        config: Config,
+        params: dict[str, torch.Tensor],
+        # inputs
         input_embeds: torch.Tensor,
         position_ids: torch.Tensor,
         qo_indptr: torch.Tensor,
-        kv_cache_at_layer: torch.Tensor,
+        # kv cache
+        kv_cache_at_layer: list[torch.Tensor],
         kv_page_indices: torch.Tensor,
         kv_page_indptr: torch.Tensor,
         kv_last_page_lens: torch.Tensor,
-        custom_mask: torch.Tensor,
+        # mask
+        custom_mask: torch.Tensor | None,
         single_token_inference_mode: bool,
+        # subpasses
         adapter_subpass: Optional[AdapterSubpass],
-    ) -> torch.Tensor:
-        """Forward pass through the Qwen2 model."""
+    ):
         hidden_states = input_embeds
         n, _ = hidden_states.size()
 
-        page_size = kv_cache_at_layer[0].shape[2]
+        page_size = int(kv_cache_at_layer[0].shape[2])
+
+        seq_lens = ops.get_seq_lens(
+            kv_page_indptr,
+            kv_last_page_lens,
+            page_size,
+        )
 
         batch_indices, batch_positions = ops.get_batch_indices_positions(
             append_indptr=qo_indptr,
-            seq_lens=ops.get_seq_lens(kv_page_indptr, kv_last_page_lens, page_size),
+            seq_lens=seq_lens,
             nnz=n,
         )
+        del seq_lens  # No longer needed
 
-        # Theoretically, we should check if it's single-token inference mode and use
-        # `self.wrapper_decode` instead of `self.wrapper_append`.
-        # However, the current FlashInfer implementation of the decode wrapper does not support
-        # does not support arbitrary ratio between the number of query and key-value heads.
-        # For example, it returns errors when running the Qwen 2 14B model, where there are
-        # 40 query heads and 8 key-value heads (5:1 ratio).
-        #
-        # For now, we just always use the append wrapper.
+        # Per the original Qwen2 implementation, FlashInfer's decode wrapper
+        # had issues with certain Q/KV head ratios.
+        # We preserve the logic of always using the append wrapper.
         _ = single_token_inference_mode
-
-        self.wrapper_append.plan(
+        wrapper = self.wrapper_append
+        wrapper.plan(
             qo_indptr=qo_indptr,
             paged_kv_indptr=kv_page_indptr,
             paged_kv_indices=kv_page_indices,
             paged_kv_last_page_len=kv_last_page_lens,
-            num_qo_heads=self.config.num_query_heads,
-            num_kv_heads=self.config.num_key_value_heads,
-            head_dim_qk=self.config.head_size,
+            num_qo_heads=config.num_query_heads,
+            num_kv_heads=config.num_key_value_heads,
+            head_dim_qk=config.head_size,
             page_size=page_size,
             custom_mask=custom_mask,
-            q_data_type=self.config.dtype,
+            q_data_type=config.dtype,
         )
-        wrapper = self.wrapper_append
 
-        for decoder_layer in self.layers:
-            layer_outputs = decoder_layer(
-                wrapper=wrapper,
-                hidden_states=hidden_states,
-                position_ids=position_ids,
-                kv_cache_at_layer=kv_cache_at_layer,
-                kv_page_indices=kv_page_indices,
-                kv_page_indptr=kv_page_indptr,
-                kv_last_page_lens=kv_last_page_lens,
-                batch_indices=batch_indices,
-                batch_positions=batch_positions,
-                adapter_subpass=adapter_subpass,
+        for layer_idx in range(config.num_layers):
+
+            # Save input for the first residual connection
+            residual = hidden_states
+
+            # 1. Input RMSNorm
+            normed_input = fun.rms_norm(
+                hidden_states,
+                normalized_shape=[config.hidden_size],
+                weight=params[f"model.layers.{layer_idx}.input_layernorm.weight"],
+                eps=config.rms_norm_eps,
             )
 
-            hidden_states = layer_outputs
+            ### BEGIN SELF_ATTN
+            # 2. QKV Projection
+            qkv_proj = fun.linear(
+                normed_input,
+                weight=params[f"model.layers.{layer_idx}.self_attn.qkv_proj.weight"],
+                bias=params.get(f"model.layers.{layer_idx}.self_attn.qkv_proj.bias"),
+            )
+            q, k, v = torch.split(
+                qkv_proj,
+                [
+                    config.num_query_heads * config.head_size,
+                    config.num_key_value_heads * config.head_size,
+                    config.num_key_value_heads * config.head_size,
+                ],
+                dim=-1,
+            )
+            del qkv_proj  # Free fused tensor immediately after split
 
-        hidden_states = self.norm(hidden_states)
+            # 3. Adapter (if any)
+            if adapter_subpass is not None:
+                adapter_subpass.execute(
+                    layer_idx,
+                    normed_input,  # Adapter needs the normed input
+                    q_state=q,
+                    k_state=k,
+                    v_state=v,
+                )
+            # We're done with the normed input for this layer
+            del normed_input
 
-        return hidden_states
+            # 4. Reshape QKV
+            q = q.view(n, config.num_query_heads, config.head_size)
+            k = k.view(n, config.num_key_value_heads, config.head_size)
+            v = v.view(n, config.num_key_value_heads, config.head_size)
 
+            # 5. Apply RoPE (in-place)
+            ops.apply_rope_pos_ids_inplace(
+                q=q,
+                k=k,
+                pos_ids=position_ids,
+                rope_theta=config.rope_theta,
+            )
 
-class Qwen2ForCausalLM(nn.Module):
-    """Qwen2 model for causal language modeling."""
+            # 6. Append K, V to cache
+            ops.append_paged_kv_cache(
+                append_key=k,
+                append_value=v,
+                batch_indices=batch_indices,
+                positions=batch_positions,
+                paged_kv_cache=kv_cache_at_layer[layer_idx],
+                kv_indices=kv_page_indices,
+                kv_indptr=kv_page_indptr,
+                kv_last_page_len=kv_last_page_lens,
+                kv_layout="NHD",
+            )
+            # K and V are now in the cache, no longer needed in flight
+            del k, v
 
-    def __init__(self, config: Qwen2Arch):
-        """Initialize the Qwen2 causal LM model."""
-        super().__init__()
-        self.config = config
-        self.model = Qwen2Model(config)
-        self.lm_head = nn.Linear(
-            config.hidden_size,
-            config.vocab_size,
-            bias=False,
-            device=config.device,
-            dtype=config.dtype,
+            # 7. Compute Attention
+            attn_output = wrapper.run(q, kv_cache_at_layer[layer_idx])
+            del q  # Q is no longer needed
+
+            attn_output = attn_output.reshape(n, -1)
+
+            # 8. Output Projection
+            attn_proj = fun.linear(
+                attn_output,
+                weight=params[f"model.layers.{layer_idx}.self_attn.o_proj.weight"],
+                bias=params.get(f"model.layers.{layer_idx}.self_attn.o_proj.bias"),
+            )
+            del attn_output
+            ### END SELF_ATTN
+
+            # 9. First Residual Connection
+            hidden_states = residual + attn_proj
+            # Free the original input and the attention projection
+            del residual, attn_proj
+
+            # Save result of first add for the second residual connection
+            residual = hidden_states
+
+            # 10. Post-Attention RMSNorm
+            normed_mlp_input = fun.rms_norm(
+                hidden_states,
+                normalized_shape=[config.hidden_size],
+                weight=params[
+                    f"model.layers.{layer_idx}.post_attention_layernorm.weight"
+                ],
+                eps=config.rms_norm_eps,
+            )
+
+            ### BEGIN MLP
+            # 11. Gate/Up Projection
+            gate_up = fun.linear(
+                normed_mlp_input,
+                weight=params[f"model.layers.{layer_idx}.mlp.gate_up_proj.weight"],
+                bias=params.get(f"model.layers.{layer_idx}.mlp.gate_up_proj.bias"),
+            )
+            # Done with normed input for MLP
+            del normed_mlp_input
+
+            gate, up = gate_up.chunk(2, dim=-1)
+            del gate_up  # Free fused tensor
+
+            # 12. SiLU Activation & Gating
+            interim_state = fun.silu(gate) * up
+            del gate, up
+
+            # 13. Down Projection
+            mlp_output = fun.linear(
+                interim_state,
+                weight=params[f"model.layers.{layer_idx}.mlp.down_proj.weight"],
+                bias=params.get(f"model.layers.{layer_idx}.mlp.down_proj.bias"),
+            )
+            del interim_state
+            ### END MLP
+
+            # 14. Second Residual Connection
+            hidden_states = residual + mlp_output
+            # Free the mid-block tensor and the mlp output
+            del residual, mlp_output
+
+        # Final RMSNorm after all layers
+        hidden_states = fun.rms_norm(
+            hidden_states,
+            normalized_shape=[config.hidden_size],
+            weight=params["model.norm.weight"],
+            eps=config.rms_norm_eps,
         )
 
-    def forward(self):
-        """
-        Should not be called. Method 'forward' is abstract in class
-        'torch.nn.modules.module' so must be overridden in child class.
-        """
-        raise NotImplementedError("Should not be called")
-
-
-__all__ = [
-    "create_fusion_map",
-    "Qwen2Mlp",
-    "Qwen2Attention",
-    "Qwen2DecoderLayer",
-    "Qwen2Model",
-    "Qwen2ForCausalLM",
-    "VERSION",
-]
+        return hidden_states

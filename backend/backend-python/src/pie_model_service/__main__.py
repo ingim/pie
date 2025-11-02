@@ -1,35 +1,7 @@
-import os
-from typing import Any
-
 import fire
 from .server import start_service
-from .model_loader import MetadataNotFoundError
-from .utils import resolve_cache_dir, terminate
-
-
-def build_config(**kwargs) -> dict[str, Any]:
-    """Normalize server configuration dictionary and resolve cache directory."""
-    config = {k: v for k, v in kwargs.items() if v is not None}
-
-    # Resolve the cache directory
-    config["cache_dir"] = resolve_cache_dir(config.get("cache_dir"))
-
-    # Check that either `max_num_kv_pages` or `gpu_mem_headroom` is set
-    if "max_num_kv_pages" not in config and "gpu_mem_headroom" not in config:
-        terminate(
-            "Config must contain either 'max_num_kv_pages' or 'gpu_mem_headroom'."
-        )
-
-    return config
-
-
-def print_config(config: dict[str, Any]) -> None:
-    """Utility to print configuration in a consistent format."""
-
-    print("--- Configuration ---")
-    for key, value in config.items():
-        print(f"{key}: {value}")
-    print("----------------------")
+from .utils import terminate
+from .config import ServiceConfig
 
 
 # Main entry point for the server
@@ -76,7 +48,7 @@ def main(
         enable_profiling: Enable unified profiler (timing + tensor tracking) (default: False).
     """
 
-    config = build_config(
+    config = ServiceConfig.from_args(
         model=model,
         host=host,
         port=port,
@@ -95,11 +67,11 @@ def main(
         enable_profiling=enable_profiling,
     )
 
-    print_config(config)
+    config.print()
 
     try:
-        start_service(config=config)
-    except MetadataNotFoundError as e:
+        start_service(config)
+    except ValueError as e:
         terminate(f"Error: {e}")
 
 

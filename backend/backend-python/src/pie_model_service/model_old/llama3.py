@@ -20,17 +20,9 @@ from profiler import start_profile, profile_attention
 
 # Direct import of backend operations based on platform
 if is_apple_silicon():
-    try:
-        import metal_kernels.ops as ops  # type: ignore[import-not-found]
-    except ImportError as e:
-        raise RuntimeError(f"metal_kernels backend is not available: {e}") from e
+    import flashinfer_metal as ops  # type: ignore[import-not-found]
 else:
-    try:
-        import flashinfer as ops  # type: ignore[import-not-found,no-redef]
-    except ImportError as e:
-        raise RuntimeError(f"flashinfer backend is not available: {e}") from e
-
-VERSION = "0.1.0"
+    import flashinfer as ops  # type: ignore[import-not-found,no-redef]
 
 
 @dataclass
@@ -498,14 +490,3 @@ class L4maForCausalLM(nn.Module):
     def forward(self):  # pragma: no cover - interface parity placeholder
         """The handler uses dedicated methods rather than Module.forward."""
         raise NotImplementedError("Should not be called")
-
-
-__all__ = [
-    "L4maForCausalLM",
-    "L4maModel",
-    "L4maDecoderLayer",
-    "L4maAttention",
-    "L4maMlp",
-    "create_fusion_map",
-    "VERSION",
-]
