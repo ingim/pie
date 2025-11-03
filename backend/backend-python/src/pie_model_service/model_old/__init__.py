@@ -234,52 +234,6 @@ def _load_regular_parameter(
     return True
 
 
-def _dequantize_from_mxfp4(
-    blocks: torch.Tensor,
-    scales: torch.Tensor,
-    fp4_values: Iterable[float],
-    device: str,
-    dtype: torch.dtype,
-) -> torch.Tensor:
-    """
-    Convert MXFP4 format tensors (blocks and scales) to bfloat16 format.
-
-    Args:
-        blocks: The packed FP4 values tensor (uint8)
-        scales: The block scales tensor
-        dtype: Target dtype for conversion (default: torch.bfloat16)
-
-    Returns:
-        Converted tensor in the target dtype
-    """
-    scales = scales.to(torch.int32) - 127
-
-    assert (
-        blocks.shape[:-1] == scales.shape
-    ), f"{blocks.shape=} does not match {scales.shape=}"
-
-    lut = torch.tensor(fp4_values, dtype=dtype, device=device)
-
-    *prefix_shape, g, b = blocks.shape
-    rows_total = math.prod(prefix_shape) * g
-
-    blocks = blocks.reshape(rows_total, b).to(device)
-    scales = scales.reshape(rows_total, 1).to(device)
-
-    # Extract low and high 4-bit indices
-    idx_lo = (blocks & 0x0F).to(torch.long)
-    idx_hi = (blocks >> 4).to(torch.long)
-
-    # Create output tensor and populate
-    out = torch.empty(rows_total, b * 2, dtype=dtype, device=device)
-    out[:, 0::2] = lut[idx_lo]  # Low 4-bit values at even indices
-    out[:, 1::2] = lut[idx_hi]  # High 4-bit values at odd indices
-
-    torch.ldexp(out, scales, out=out)
-
-    return out.reshape(*prefix_shape, g, b * 2).view(*prefix_shape, g * b * 2)
-
-
 ### -----------
 
 

@@ -1,7 +1,6 @@
 import fire
-from .server import start_service
-from .utils import terminate
-from .config import ServiceConfig
+from .server import start_server
+from .service import ServiceConfig, Service
 
 
 # Main entry point for the server
@@ -50,9 +49,6 @@ def main(
 
     config = ServiceConfig.from_args(
         model=model,
-        host=host,
-        port=port,
-        internal_auth_token=internal_auth_token,
         cache_dir=cache_dir,
         kv_page_size=kv_page_size,
         max_dist_size=max_dist_size,
@@ -66,13 +62,10 @@ def main(
         dtype=dtype,
         enable_profiling=enable_profiling,
     )
-
     config.print()
 
-    try:
-        start_service(config)
-    except ValueError as e:
-        terminate(f"Error: {e}")
+    service = Service(config)
+    start_server(host=host, port=port, auth_token=internal_auth_token, service=service)
 
 
 if __name__ == "__main__":

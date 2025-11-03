@@ -8,7 +8,6 @@ import sys
 import queue
 import threading
 import time
-from typing import Any
 import msgpack
 import msgspec
 import zmq
@@ -26,36 +25,22 @@ from .message import (
     UploadAdapterRequest,
 )
 
-from .handler import Handler
-from .config import ServiceConfig
+from .service import Service
 from .utils import terminate
 
-
-class HandlerId(enum.Enum):
-    """Enumeration of handler message types."""
-
-    HANDSHAKE = 0
-    HEARTBEAT = 1
-    QUERY = 2
-    FORWARD_PASS = 3
-    EMBED_IMAGE = 4
-    INITIALIZE_ADAPTER = 5
-    UPDATE_ADAPTER = 6
-    UPLOAD_HANDLER = 7
-    DOWNLOAD_HANDLER = 8
+HEARTBEAT_TIMEOUT = 15.0  # seconds
 
 
-def start_service(
-    config: ServiceConfig,
+def start_server(
+    host: str,
+    port: int,
+    auth_token: str,
+    service: Service,
 ):
     """Spin up the backend service using the provided handler implementation."""
 
-    unique_id = random.randint(1000, 9999)
+    unique_id = random.randint(1000000, 9999999)
     endpoint = f"ipc:///tmp/pie-model-service-{unique_id}"
-
-    handler = Handler(
-        config,
-    )
 
     context = zmq.Context()
     socket = context.socket(zmq.ROUTER)
@@ -86,13 +71,13 @@ def start_service(
 
     threading.Thread(
         target=heartbeat_thread,
-        args=(heartbeat_request_queue, response_queue, handler),
+        args=(heartbeat_request_queue, response_queue, service),
         daemon=True,
     ).start()
 
     threading.Thread(
         target=worker_thread,
-        args=(work_request_queue, response_queue, handler),
+        args=(work_request_queue, response_queue, service),
         daemon=True,
     ).start()
 
@@ -108,7 +93,7 @@ def start_service(
 
     threading.Thread(
         target=register_thread,
-        args=(config, endpoint),
+        args=(host, port, auth_token, endpoint),
         daemon=True,
     ).start()
 
@@ -132,17 +117,17 @@ def start_service(
         print("Server shutdown complete.")
 
 
-def register_thread(config: ServiceConfig, endpoint: str) -> None:
+def register_thread(host: str, port: int, auth_token: str, endpoint: str) -> None:
     """Register this service with the controller."""
 
-    controller_addr = f"ws://{config.host}:{config.port}"
+    controller_addr = f"ws://{host}:{port}"
     try:
         with connect(controller_addr) as websocket:
             auth_msg = msgpack.packb(
                 {
                     "type": "internal_authenticate",
                     "corr_id": 0,
-                    "token": config.internal_auth_token,
+                    "token": auth_token,
                 },
                 use_bin_type=True,
             )
@@ -162,7 +147,7 @@ def register_thread(config: ServiceConfig, endpoint: str) -> None:
                     "type": "attach_remote_service",
                     "corr_id": 0,
                     "endpoint": endpoint,
-                    "service_name": config.model,
+                    "service_name": f"service-{random.randint(1000000, 9999999)}",
                     "service_type": "model",
                 },
                 use_bin_type=True,
@@ -191,21 +176,20 @@ def register_thread(config: ServiceConfig, endpoint: str) -> None:
 
 
 def heartbeat_thread(
-    heartbeat_request_queue: queue.Queue, response_queue: queue.Queue, handler: Any
+    heartbeat_request_queue: queue.Queue, response_queue: queue.Queue, service: Service
 ) -> None:
     """Heartbeat thread that responds to heartbeat requests to the controller. And if no
     heartbeat is received for the timeout period, terminates the program."""
 
-    heartbeat_timeout = 15.0
     last_heartbeat_time = time.monotonic()
 
     try:
         while True:
             time.sleep(1)
 
-            if time.monotonic() - last_heartbeat_time > heartbeat_timeout:
+            if time.monotonic() - last_heartbeat_time > HEARTBEAT_TIMEOUT:
                 print(
-                    f"[!] Heartbeat timeout after {heartbeat_timeout}s, exiting",
+                    f"[!] Heartbeat timeout after {HEARTBEAT_TIMEOUT}s, exiting",
                     file=sys.stderr,
                 )
                 os._exit(1)
@@ -217,7 +201,7 @@ def heartbeat_thread(
                 client_identity, corr_id_bytes, handler_id_bytes, reqs = (
                     heartbeat_request_queue.get()
                 )
-                resps = handler.heartbeat(reqs)
+                resps = service.heartbeat(reqs)
                 response_queue.put(
                     (client_identity, corr_id_bytes, handler_id_bytes, resps)
                 )
@@ -227,8 +211,22 @@ def heartbeat_thread(
         terminate(f"Unhandled error occurred in the heartbeat thread: {exc}")
 
 
+class HandlerId(enum.Enum):
+    """Enumeration of handler message types."""
+
+    HANDSHAKE = 0
+    HEARTBEAT = 1
+    QUERY = 2
+    FORWARD_PASS = 3
+    EMBED_IMAGE = 4
+    INITIALIZE_ADAPTER = 5
+    UPDATE_ADAPTER = 6
+    UPLOAD_HANDLER = 7
+    DOWNLOAD_HANDLER = 8
+
+
 def worker_thread(
-    work_request_queue: queue.Queue, response_queue: queue.Queue, handler: Any
+    work_request_queue: queue.Queue, response_queue: queue.Queue, service: Service
 ) -> None:
     """Worker thread that processes incoming requests from the controller."""
 
@@ -241,21 +239,21 @@ def worker_thread(
             resps = []
             match handler_id:
                 case HandlerId.HANDSHAKE.value:
-                    resps = handler.handshake(reqs)
+                    resps = service.handshake(reqs)
                 case HandlerId.QUERY.value:
-                    resps = handler.query(reqs)
+                    resps = service.query(reqs)
                 case HandlerId.FORWARD_PASS.value:
-                    resps = handler.forward_pass(reqs)
+                    resps = service.forward_pass(reqs)
                 case HandlerId.EMBED_IMAGE.value:
-                    handler.embed_image(reqs)
+                    service.embed_image(reqs)
                 case HandlerId.INITIALIZE_ADAPTER.value:
-                    handler.initialize_adapter(reqs)
+                    service.initialize_adapter(reqs)
                 case HandlerId.UPDATE_ADAPTER.value:
-                    handler.update_adapter(reqs)
+                    service.update_adapter(reqs)
                 case HandlerId.UPLOAD_HANDLER.value:
-                    handler.upload_handler(reqs)
+                    service.upload_adapter(reqs)
                 case HandlerId.DOWNLOAD_HANDLER.value:
-                    resps = handler.download_handler(reqs)
+                    resps = service.download_adapter(reqs)
                 case HandlerId.HEARTBEAT.value:
                     raise RuntimeError(
                         "Heartbeat should not be handled by the worker thread"

@@ -10,13 +10,17 @@ from __future__ import annotations
 
 import time
 from contextlib import contextmanager, nullcontext
+from pathlib import Path
 
 import numpy as np
 import torch
 
 import message
-from .config import ServiceConfig
+from .adapter import AdapterSubpass
+from .model import Model
 from .utils import is_apple_silicon
+from dataclasses import dataclass, asdict
+from .utils import resolve_cache_dir, terminate
 
 # Direct import of backend operations based on platform
 # metal_kernels now provides the same API structure as flashinfer
@@ -26,7 +30,87 @@ else:
     import flashinfer as ops  # type: ignore[import-not-found]
 
 
-class Handler:
+@dataclass
+class ServiceConfig:
+    """
+    Configuration for the server, validated upon creation.
+
+    Use the `ServerConfig.from_args(...)` factory method to create
+    a new instance from raw arguments.
+    """
+
+    # Required args
+    model: str
+    cache_dir: str
+    # host: str = "localhost"
+    # port: int = 10123
+    # internal_auth_token: str | None = None
+    kv_page_size: int = 16
+    max_dist_size: int = 64
+    max_num_embeds: int = 128
+    max_batch_tokens: int = 10240
+    max_num_adapters: int = 48
+    max_adapter_rank: int = 8
+    max_num_kv_pages: int | None = None
+    gpu_mem_headroom: float | None = None
+    device: torch.device | None = None
+    dtype: torch.dtype = torch.bfloat16
+    enable_profiling: bool = False
+
+    @classmethod
+    def from_args(
+        cls,
+        model: str,
+        cache_dir: str | None = None,  # Input can be None
+        kv_page_size: int = 16,
+        max_dist_size: int = 64,
+        max_num_embeds: int = 128,
+        max_batch_tokens: int = 10240,
+        max_num_adapters: int = 48,
+        max_adapter_rank: int = 8,
+        max_num_kv_pages: int | None = None,
+        gpu_mem_headroom: float | None = None,
+        device: str | None = None,
+        dtype: str = "bfloat16",
+        enable_profiling: bool = False,
+    ) -> ServiceConfig:
+        """
+        Factory method to build a validated and resolved ServerConfig.
+        This replaces the original `build_config` logic.
+        """
+        # 2. Resolution (from build_config)
+        resolved_cache_dir = resolve_cache_dir(cache_dir)
+
+        # 3. Create the immutable config instance
+        return cls(
+            model=model,
+            cache_dir=resolved_cache_dir,  # Use the resolved value
+            kv_page_size=kv_page_size,
+            max_dist_size=max_dist_size,
+            max_num_embeds=max_num_embeds,
+            max_batch_tokens=max_batch_tokens,
+            max_num_adapters=max_num_adapters,
+            max_adapter_rank=max_adapter_rank,
+            max_num_kv_pages=max_num_kv_pages,
+            gpu_mem_headroom=gpu_mem_headroom,
+            device=torch.device(device),
+            dtype=torch.dtype(dtype),
+            enable_profiling=enable_profiling,
+        )
+
+    def print(self) -> None:
+        """
+        Utility to print configuration in a consistent format.
+        This replaces the original `print_config` function.
+        """
+        print("--- Configuration ---")
+        # asdict() conveniently converts the dataclass to a dict
+        for key, value in asdict(self).items():
+            print(f"{key}: {value}")
+        print("----------------------")
+
+
+class Service:
     """Python backend handler using platform-appropriate operations."""
 
     # max_num_kv_pages: int
@@ -42,98 +126,59 @@ class Handler:
         self.adapters = {}
         self.config = config  # Store config for later use
 
-        self.lm, self.model_info = load_model(
-            config,
+        self.model = Model(
+            path=Path(config.cache_dir),
+            name=config.model,
+            device=config.device,
         )
 
-        # self.kv_page_size = config["kv_page_size"]
-        # self.max_dist_size = config["max_dist_size"]
-        # self.max_num_embeds = config["max_num_embeds"]
-        # self.max_batch_tokens = config["max_batch_tokens"]
-        # self.max_num_adapters = config["max_num_adapters"]
-        # self.max_adapter_rank = config["max_adapter_rank"]
-        # self.dtype = getattr(torch, config["dtype"])
-        # self.device = config["device"]
-        # self.logits_dtype = getattr(torch, config["dtype"])
-
-        # If `gpu_mem_headroom` is set by the user, then we will cap the KV
-        # cache size so that there is some percentage of GPU memory left over
-        # after loading the model and allocating the KV cache.
-        if "gpu_mem_headroom" in config:
-            adaptive_kv_cache_size = True
-        else:
-            adaptive_kv_cache_size = False
-
-        # If the KV cache size is fixed, then we allocate the KV cache,
-        # which are big contiguous tensors, before loading the model,
-        # since during model loading, many temporary tensors are created,
-        # which may lead to fragmentation and out-of-memory errors if big
-        # tensors are not allocated up front.
-        if not adaptive_kv_cache_size:
-            self.kv_cache_at_layer = [
-                torch.zeros(
-                    (
-                        config.max_num_kv_pages,
-                        2,
-                        config.kv_page_size,
-                        self.model_info.architecture.num_key_value_heads,
-                        self.model_info.architecture.head_size,
-                    ),
-                    dtype=config.dtype,
-                    device=config.device,
-                )
-                for _ in range(self.model_info.architecture.num_layers)
-            ]
-
         self.embeds = torch.empty(
-            (self.max_num_embeds, self.model_info.architecture.hidden_size),
-            device=self.device,
-            dtype=self.dtype,
+            (config.max_num_embeds, self.model.config.hidden_size),
+            device=config.device,
+            dtype=config.dtype,
         )
 
         self.adapter_at_layer = [
             (
                 torch.zeros(
                     (
-                        self.max_num_adapters,
-                        self.max_adapter_rank * 3,
-                        self.model_info.architecture.hidden_size,
+                        config.max_num_adapters,
+                        config.max_adapter_rank * 3,
+                        self.model.config.hidden_size,
                     ),
-                    dtype=self.dtype,
-                    device=self.device,
+                    dtype=config.dtype,
+                    device=config.device,
                 ),
                 torch.zeros(
                     (
-                        self.max_num_adapters,
-                        self.model_info.architecture.head_size
+                        config.max_num_adapters,
+                        self.model.config.head_size
                         * (
-                            self.model_info.architecture.num_query_heads
-                            + self.model_info.architecture.num_key_value_heads * 2
+                            self.model.config.num_query_heads
+                            + self.model.config.num_key_value_heads * 2
                         ),
-                        self.max_adapter_rank,
+                        config.max_adapter_rank,
                     ),
-                    dtype=self.dtype,
-                    device=self.device,
+                    dtype=config.dtype,
+                    device=config.device,
                 ),
             )
-            for _ in range(self.model_info.architecture.num_layers)
+            for _ in range(self.model.config.num_layers)
         ]
 
-        # If `gpu_mem_headroom` is set by the user, then we have to allocate the KV
-        # cache at the end and dynamically calculate the number of KV pages based on
-        # the available GPU memory.
-        if adaptive_kv_cache_size:
+        # Automatically decide max_num_kv_pages based on the current memory availability
+        if config.gpu_mem_headroom is not None:
             # Calculate the available GPU memory for the KV cache after accounting for
             # the reserved GPU memory specified through `gpu_mem_headroom`.
             free_gpu_mem_bytes, total_gpu_mem_bytes = torch.cuda.mem_get_info(
-                self.device
+                config.device
             )
             used_gpu_mem_bytes = total_gpu_mem_bytes - free_gpu_mem_bytes
-            reserved_gpu_mem_percentage = config["gpu_mem_headroom"]
-            useable_gpu_mem_bytes = total_gpu_mem_bytes * (
+            reserved_gpu_mem_percentage = config.gpu_mem_headroom
+            usable_gpu_mem_bytes = total_gpu_mem_bytes * (
                 1 - (reserved_gpu_mem_percentage / 100)
             )
-            available_kv_cache_bytes = useable_gpu_mem_bytes - used_gpu_mem_bytes
+            available_kv_cache_bytes = usable_gpu_mem_bytes - used_gpu_mem_bytes
 
             if available_kv_cache_bytes <= 0:
                 raise ValueError(
@@ -142,45 +187,44 @@ class Handler:
                 )
 
             # Calculate the number of KV pages based on the available GPU memory.
-            self.max_num_kv_pages = int(
+            max_num_kv_pages = int(
                 available_kv_cache_bytes
                 / (
-                    self.kv_page_size
+                    config.kv_page_size
                     * 2
-                    * self.model_info.architecture.num_key_value_heads
-                    * self.model_info.architecture.head_size
-                    * self.model_info.architecture.num_layers
-                    * self.dtype.itemsize
+                    * self.model.config.num_key_value_heads
+                    * self.model.config.head_size
+                    * self.model.config.num_layers
+                    * config.dtype.itemsize
                 )
             )
 
             # If the user also specified "max_num_kv_pages", then we will use the
-            # smaller of the two values.
-            if "max_num_kv_pages" in config:
-                if self.max_num_kv_pages > config["max_num_kv_pages"]:
-                    self.max_num_kv_pages = config["max_num_kv_pages"]
-                elif self.max_num_kv_pages < config["max_num_kv_pages"]:
+            # larger of the two values.
+            if config.max_num_kv_pages is not None:
+                if max_num_kv_pages > config.max_num_kv_pages:
                     print(
-                        f"'max_num_kv_pages' is reduced to {self.max_num_kv_pages} "
+                        f"'max_num_kv_pages' is increased to {max_num_kv_pages} "
                         "to respect 'gpu_mem_headroom'."
                     )
+                    config.max_num_kv_pages = max_num_kv_pages
+            else:
+                config.max_num_kv_pages = max_num_kv_pages
 
-            self.kv_cache_at_layer = [
-                torch.zeros(
-                    (
-                        self.max_num_kv_pages,
-                        2,
-                        self.kv_page_size,
-                        self.model_info.architecture.num_key_value_heads,
-                        self.model_info.architecture.head_size,
-                    ),
-                    dtype=self.dtype,
-                    device=self.device,
-                )
-                for _ in range(self.model_info.architecture.num_layers)
-            ]
-
-        self.inter_fill_time = time.time()
+        self.kv_cache_at_layer = [
+            torch.zeros(
+                (
+                    config.max_num_kv_pages,
+                    2,
+                    config.kv_page_size,
+                    self.model.config.num_key_value_heads,
+                    self.model.config.head_size,
+                ),
+                dtype=config.dtype,
+                device=config.device,
+            )
+            for _ in range(self.model.config.num_layers)
+        ]
 
     def handshake(
         self, reqs: list[message.HandshakeRequest]
@@ -190,26 +234,30 @@ class Handler:
         for _ in reqs:
             # Request details not currently used
 
+            metadata = self.model.get_metadata()
+            tokenizer = self.model.get_tokenizer()
+            chat_template = self.model.get_chat_template()
+
             resp = message.HandshakeResponse(
-                version=self.model_info.version,
-                model_name=self.model_info.name,
+                version=metadata["version"],
+                model_name=metadata["name"],
                 model_traits=["todo"],
-                model_description=self.model_info.description,
-                prompt_template=self.model_info.template_content,
-                prompt_template_type=self.model_info.template_type,
-                prompt_stop_tokens=self.model_info.stop_tokens,
-                kv_page_size=self.kv_page_size,
-                max_batch_tokens=self.max_batch_tokens,
+                model_description=metadata["description"],
+                prompt_template=chat_template["template_content"],
+                prompt_template_type=chat_template["template_type"],
+                prompt_stop_tokens=chat_template["stop_tokens"],
+                kv_page_size=self.config.kv_page_size,
+                max_batch_tokens=self.config.max_batch_tokens,
                 resources={
-                    0: self.max_num_kv_pages,
-                    1: self.max_num_embeds,
-                    2: self.max_num_adapters,
+                    0: self.config.max_num_kv_pages,
+                    1: self.config.max_num_embeds,
+                    2: self.config.max_num_adapters,
                 },
-                tokenizer_num_vocab=self.model_info.tokenizer.num_vocab,
-                tokenizer_merge_table=self.model_info.tokenizer.merge_table,
-                tokenizer_special_tokens=self.model_info.tokenizer.special_tokens,
-                tokenizer_split_regex=self.model_info.tokenizer.split_regex,
-                tokenizer_escape_non_printable=self.model_info.tokenizer.escape_non_printable,
+                tokenizer_num_vocab=tokenizer["num_vocab"],
+                tokenizer_merge_table=tokenizer["merge_table"],
+                tokenizer_special_tokens=tokenizer["special_tokens"],
+                tokenizer_split_regex=tokenizer["split_regex"],
+                tokenizer_escape_non_printable=tokenizer["escape_non_printable"],
             )
             resps.append(resp)
         return resps
@@ -230,98 +278,33 @@ class Handler:
         """
         Embeds images into the specified embed pointers.
         """
-        for req in reqs:
-            if len(req.embed_ptrs) > self.max_num_embeds:
-                raise ValueError(
-                    f"Number of embed pointers {len(req.embed_ptrs)} exceeds "
-                    f"maximum {self.max_num_embeds}."
-                )
-
-            image_tensor = self.ops.image.decode_image(  # type: ignore[union-attr]
-                req.image_blob, dtype=self.dtype, device=self.device
-            )
-            image_embed = self.lm.model.embed_image(image_tensor)  # type: ignore[attr-defined]
-
-            for i, ptr in enumerate(req.embed_ptrs):
-                if ptr < 0 or ptr >= self.max_num_embeds:
-                    raise ValueError(
-                        f"Embed pointer {ptr} out of range [0, {self.max_num_embeds})."
-                    )
-                self.embeds[ptr].copy_(image_embed[i], non_blocking=True)
+        raise NotImplementedError
 
     @torch.inference_mode()
     def initialize_adapter(self, reqs: list[message.InitializeAdapterRequest]):
-        """Initialize adapter functionality."""
-        # cfg = self.lm.config  # Available if needed
-
-        for _ in reqs:
-            pass  # Request details not currently used
+        raise NotImplementedError
 
     @torch.inference_mode()
     def update_adapter(self, reqs: list[message.UpdateAdapterRequest]):
-        """Update adapter functionality."""
-        for req in reqs:
-            if req.adapter_ptr in self.adapters:
-                pass
+        raise NotImplementedError
 
     @torch.inference_mode()
     def forward_pass(self, reqs: list[message.ForwardPassRequest]):
-        """
-        Processes a batch of forward pass requests through the language model.
-        """
-        with start_profile("forward_pass_total"):
-            # Sort requests by adapter to optimize the adapter subpass.
-            with start_profile("request_sorting"):
-                reqs = sorted(reqs, key=lambda o: (o.adapter is None, o.adapter))
+        reqs = sorted(reqs, key=lambda o: (o.adapter is None, o.adapter))
 
-            # 1. Consolidate and process all requests into a single batch.
-            with start_profile("batch_consolidation"):
-                batch = ForwardPassBatch(self)
-                for req in reqs:
-                    batch.add_request(req)
+        batch = ForwardPassBatch(self)
+        for req in reqs:
+            batch.add_request(req)
 
-            # 2. Finalize the batch to get model inputs as tensors.
-            with start_profile("batch_finalize"):
-                model_inputs = batch.finalize()
+        model_inputs = batch.finalize()
 
-            # 3. Run the forward pass through the model.
-            with start_profile("model_forward"):
-                # Track PyTorch operations with fine-grained detail
-                tracker_context = self._get_tracker()
+        output_embeds = self.model.forward(
+            kv_cache_at_layer=self.kv_cache_at_layer, **model_inputs
+        )
 
-                with tracker_context:
-                    with _device_context(self.device):
-                        output_embeds = self.lm.model.forward(  # type: ignore[attr-defined]
-                            kv_cache_at_layer=self.kv_cache_at_layer, **model_inputs
-                        )
-
-            # 4. Package the model outputs into response messages.
-            with start_profile("package_responses"):
-                responses = batch.package_responses(output_embeds)
+        responses = batch.package_responses(output_embeds)
 
         return responses
-
-    def _get_tracker(self):
-        """
-        Get profiling tracker for fine-grained operation tracking.
-
-        When profiling is enabled, this registers forward hooks on all leaf modules
-        to capture exact tensor IDs and execution order. The hook data is saved in
-        the operation_log section of the unified profile JSON.
-        """
-        if not self.config.get("enable_profiling", False):
-            return nullcontext()
-
-        try:
-            # pylint: disable=import-outside-toplevel
-            from profiler import get_memory_tracker
-            from profiler.hook_based_tracker import create_hook_tracker
-
-            tracker = get_memory_tracker()
-            hook_tracker = create_hook_tracker(tracker)
-            return hook_tracker.track_model_with_hooks(self.lm.model)  # type: ignore[arg-type]
-        except (ImportError, OSError, RuntimeError, AttributeError):
-            return nullcontext()
 
     def heartbeat(
         self, reqs: list[message.HeartbeatRequest]
@@ -332,34 +315,13 @@ class Handler:
             resps.append(message.HeartbeatResponse())
         return resps
 
-    def upload_handler(self, reqs: list[message.UploadAdapterRequest]):
-        """Handle adapter upload requests."""
-        _ = reqs  # Parameter not currently used
-        raise NotImplementedError("upload_handler not yet implemented")
+    def upload_adapter(self, reqs: list[message.UploadAdapterRequest]):
+        raise NotImplementedError
 
-    def download_handler(
+    def download_adapter(
         self, reqs: list[message.DownloadAdapterRequest]
     ) -> list[message.DownloadAdapterResponse]:
-        """Handle adapter download requests."""
-        _ = reqs  # Parameter not currently used
-        raise NotImplementedError("download_handler not yet implemented")
-
-
-@contextmanager
-def _device_context(device: str):
-    """Context manager that activates the appropriate device when possible."""
-    if not device:
-        yield
-        return
-
-    if device.startswith("cuda") and torch.cuda.is_available():
-        with torch.cuda.device(device):
-            yield
-        return
-
-    # For CPU/MPS/Metal we rely on tensors already being on the target device.
-    with nullcontext():
-        yield
+        raise NotImplementedError
 
 
 def _decode_brle(brle_buffer: list[int]) -> np.ndarray:
@@ -391,43 +353,71 @@ class ForwardPassBatch:
     # Static constant for the maximum top_k value for distributions.
     TOP_K_MAX_BOUND = 1024
 
-    def __init__(self, handler: Handler):
+    # important
+    service: Service
+    requests: list[message.ForwardPassRequest]
+
+    # inputs for the model
+    adapter_indices: list[int]
+    seeds: list[int]
+    kv_page_indices: list[int]
+    kv_page_indptr: list[int]
+    kv_last_page_lengths: list[int]
+    qo_indptr: list[int]
+    attention_masks: list[np.ndarray]
+    batch_token_ids: list[int]
+    batch_position_ids: list[int]
+
+    # tracking states
+    total_tokens_in_batch: int
+    single_token_inference_mode: bool
+    adapter_subpass_needed: bool
+
+    # Output mapping for all logit-based operations (dists and sampling)
+    indices_for_logits: list[int]
+    indices_for_embed_storage: list[int]
+    embed_storage_pointers: list[int]
+
+    # sampler type and consolidated parameters
+    sampler_type: list[int]
+    sampler_params: list[dict]
+
+    def __init__(self, service: Service):
         """Initializes the batch processor."""
-        self._handler = handler
-        self.logits_dtype = getattr(handler, "logits_dtype", handler.dtype)
-        self._original_reqs: list[message.ForwardPassRequest] = []
+        self.service = service
+        self.requests = []
 
         # Inputs for the model
-        self.adapter_indices: list[int] = []
-        self.seeds: list[int] = []
-        self.kv_page_indices: list[int] = []
-        self.kv_page_indptr: list[int] = [0]
-        self.kv_last_page_lengths: list[int] = []
-        self.qo_indptr: list[int] = [0]
-        self.attention_masks: list[np.ndarray] = []
-        self.batch_token_ids: list[int] = []
-        self.batch_position_ids: list[int] = []
+        self.adapter_indices = []
+        self.seeds = []
+        self.kv_page_indices = []
+        self.kv_page_indptr = [0]
+        self.kv_last_page_lengths = []
+        self.qo_indptr = [0]
+        self.attention_masks = []
+        self.batch_token_ids = []
+        self.batch_position_ids = []
 
         # Tracking state
-        self.total_tokens_in_batch: int = 0
-        self.single_token_inference_mode: bool = True
-        self.adapter_subpass_needed: bool = False
+        self.total_tokens_in_batch = 0
+        self.single_token_inference_mode = True
+        self.adapter_subpass_needed = False
 
         # Output mapping for all logit-based operations (dists and sampling)
-        self.indices_for_logits: list[int] = []
-        self.indices_for_embed_storage: list[int] = []
-        self.embed_storage_pointers: list[int] = []
+        self.indices_for_logits = []
+        self.indices_for_embed_storage = []
+        self.embed_storage_pointers = []
 
         # Sampler type and consolidated parameters
-        self.sampler_type: list[int] = []
-        self.sampler_params: list[dict] = []
+        self.sampler_type = []
+        self.sampler_params = []
 
     def add_request(self, req: message.ForwardPassRequest):
         """Processes and adds a single request to the batch."""
-        self._original_reqs.append(req)
+        self.requests.append(req)
 
         # Handle adapter information
-        if req.adapter is not None and req.adapter in self._handler.adapters:
+        if req.adapter is not None and req.adapter in self.service.adapters:
             seed = req.adapter_seed if req.adapter_seed is not None else 0
             self.seeds.extend([seed] * len(req.input_tokens))
             self.adapter_indices.append(req.adapter)
@@ -468,8 +458,8 @@ class ForwardPassBatch:
 
             if sampler_idx == 0:
                 params["top_k"] = min(
-                    sampler_config.get("top_k", self._handler.max_dist_size),
-                    self._handler.max_dist_size,
+                    sampler_config.get("top_k", self.service.config.max_dist_size),
+                    self.service.config.max_dist_size,
                 )
             else:
                 params["top_k"] = sampler_config.get("top_k", 0)
@@ -505,7 +495,8 @@ class ForwardPassBatch:
         # Ensure we have at least one page for proper computation
         if len(kv_page_ptrs) >= 1:
             sequence_length = (
-                self._handler.kv_page_size * (len(kv_page_ptrs) - 1) + kv_page_last_len
+                self.service.config.kv_page_size * (len(kv_page_ptrs) - 1)
+                + kv_page_last_len
             )
         else:
             sequence_length = kv_page_last_len
@@ -538,61 +529,53 @@ class ForwardPassBatch:
 
     def finalize(self) -> dict:
         """Finalizes batch preparation, creating tensors and the adapter subpass."""
-        device = self._handler.device
+        device = self.service.config.device
 
-        with start_profile("finalize_adapter_setup"):
-            adapter_subpass = None
-            if self.adapter_subpass_needed:
-                adapter_subpass_class = ensure_adapter_available()
-                seeds_tensor = torch.as_tensor(
-                    self.seeds, device=device, dtype=torch.long
-                )
-                adapter_subpass = adapter_subpass_class(
-                    adapter_at_layer=self._handler.adapter_at_layer,
-                    adapter_indices=self.adapter_indices,
-                    adapter_extras=self._handler.adapters,
-                    rand_seeds=seeds_tensor,
-                    qo_indptr=self.qo_indptr,
-                )
-
-        with start_profile("finalize_tensor_creation"):
-            batched_attention_mask = (
-                np.concatenate(self.attention_masks)
-                if self.attention_masks
-                else np.array([], dtype=np.bool_)
-            )
-            token_ids_tensor = torch.as_tensor(
-                self.batch_token_ids, device=device, dtype=torch.int32
+        adapter_subpass = None
+        if self.adapter_subpass_needed:
+            seeds_tensor = torch.as_tensor(self.seeds, device=device, dtype=torch.long)
+            adapter_subpass = AdapterSubpass(
+                adapter_at_layer=self.service.adapter_at_layer,
+                adapter_indices=self.adapter_indices,
+                adapter_extras=self.service.adapters,
+                rand_seeds=seeds_tensor,
+                qo_indptr=self.qo_indptr,
             )
 
-        with start_profile("finalize_embedding_lookup"):
-            embed_tokens = self._handler.lm.model.embed_tokens  # type: ignore[attr-defined]
-            input_embeds = embed_tokens(token_ids_tensor)  # type: ignore[operator]
+        batched_attention_mask = (
+            np.concatenate(self.attention_masks)
+            if self.attention_masks
+            else np.array([], dtype=np.bool_)
+        )
+        token_ids_tensor = torch.as_tensor(
+            self.batch_token_ids, device=device, dtype=torch.int32
+        )
 
-        with start_profile("finalize_create_input_dict"):
-            result = {
-                "input_embeds": input_embeds,
-                "position_ids": torch.as_tensor(
-                    self.batch_position_ids, device=device, dtype=torch.int32
-                ),
-                "qo_indptr": torch.as_tensor(
-                    self.qo_indptr, device=device, dtype=torch.int32
-                ),
-                "kv_page_indices": torch.as_tensor(
-                    self.kv_page_indices, device=device, dtype=torch.int32
-                ),
-                "kv_page_indptr": torch.as_tensor(
-                    self.kv_page_indptr, device=device, dtype=torch.int32
-                ),
-                "kv_last_page_lens": torch.as_tensor(
-                    self.kv_last_page_lengths, device=device, dtype=torch.int32
-                ),
-                "custom_mask": torch.as_tensor(
-                    batched_attention_mask, device=device, dtype=torch.bool
-                ),
-                "single_token_inference_mode": self.single_token_inference_mode,
-                "adapter_subpass": adapter_subpass,
-            }
+        input_embeds = self.service.model.embed_tokens(token_ids_tensor)  # type: ignore[operator]
+
+        result = {
+            "input_embeds": input_embeds,
+            "position_ids": torch.as_tensor(
+                self.batch_position_ids, device=device, dtype=torch.int32
+            ),
+            "qo_indptr": torch.as_tensor(
+                self.qo_indptr, device=device, dtype=torch.int32
+            ),
+            "kv_page_indices": torch.as_tensor(
+                self.kv_page_indices, device=device, dtype=torch.int32
+            ),
+            "kv_page_indptr": torch.as_tensor(
+                self.kv_page_indptr, device=device, dtype=torch.int32
+            ),
+            "kv_last_page_lens": torch.as_tensor(
+                self.kv_last_page_lengths, device=device, dtype=torch.int32
+            ),
+            "custom_mask": torch.as_tensor(
+                batched_attention_mask, device=device, dtype=torch.bool
+            ),
+            "single_token_inference_mode": self.single_token_inference_mode,
+            "adapter_subpass": adapter_subpass,
+        }
 
         return result
 
@@ -601,35 +584,31 @@ class ForwardPassBatch:
     ) -> list[message.ForwardPassResponse]:
         """Packages the model outputs into responses for each original request."""
         # Handle storing specified embeddings
+
+        device = self.service.config.device
+
         if self.indices_for_embed_storage:
             embeddings_to_store = output_embeds[self.indices_for_embed_storage]
             for i, ptr in enumerate(self.embed_storage_pointers):
-                self._handler.embeds[ptr].copy_(
+                self.service.embeds[ptr].copy_(
                     embeddings_to_store[i], non_blocking=True
                 )
 
         if not self.indices_for_logits:
             return [
-                message.ForwardPassResponse(dists=[], tokens=[])
-                for _ in self._original_reqs
+                message.ForwardPassResponse(dists=[], tokens=[]) for _ in self.requests
             ]
 
         # Calculate logits for all required tokens (both dists and samples)
         logits_input = output_embeds[self.indices_for_logits]
-        if logits_input.dtype != self.logits_dtype:
-            logits_input = logits_input.to(self.logits_dtype)
 
-        logits = self._handler.lm.lm_head(logits_input)  # type: ignore[attr-defined, operator]
-
-        # Promote logits to handler dtype for numerically stable softmax on Metal/MPS
-        if logits.dtype != self.logits_dtype:
-            logits = logits.to(dtype=self.logits_dtype)
+        logits = self.service.lm.lm_head(logits_input)  # type: ignore[attr-defined, operator]
 
         # Apply temperature scaling to all logits
         temperatures = torch.tensor(
             [p["temperature"] for p in self.sampler_params],
-            device=self._handler.device,
-            dtype=self.logits_dtype,
+            device=device,
+            dtype=logits.dtype,
         ).unsqueeze(1)
         scaled_logits = logits / torch.clamp(temperatures, min=1e-6)
 
@@ -652,16 +631,14 @@ class ForwardPassBatch:
             None
         ] * num_logit_requests
         final_tokens_tensor = torch.empty(
-            num_logit_requests, dtype=torch.long, device=self._handler.device
+            num_logit_requests, dtype=torch.long, device=device
         )
 
         for sampler_idx, indices in sampler_groups.items():
             if not indices:
                 continue
 
-            indices_tensor = torch.tensor(
-                indices, device=self._handler.device, dtype=torch.long
-            )
+            indices_tensor = torch.tensor(indices, device=device, dtype=torch.long)
             group_probs = probs.index_select(0, indices_tensor)
 
             # Handle distributions (sampler_idx=0)
@@ -680,50 +657,50 @@ class ForwardPassBatch:
             else:
                 sampled = None
                 if sampler_idx == 1:  # Old 0: sampling_from_probs
-                    ops_sampling = self._handler.ops.sampling  # type: ignore
+                    ops_sampling = self.service.ops.sampling  # type: ignore
                     sampled = ops_sampling.sampling_from_probs(group_probs)
                 elif sampler_idx == 2:  # Old 1: top_p_sampling_from_probs
                     top_p_vals = torch.tensor(
                         [self.sampler_params[i]["top_p"] for i in indices],
-                        device=self._handler.device,
-                        dtype=self._handler.dtype,
+                        device=device,
+                        dtype=self.service.config.dtype,
                     )
-                    ops_sampling = self._handler.ops.sampling  # type: ignore
+                    ops_sampling = self.service.ops.sampling  # type: ignore
                     sampled = ops_sampling.top_p_sampling_from_probs(
                         group_probs, top_p=top_p_vals
                     )
                 elif sampler_idx == 3:  # Old 2: top_k_sampling_from_probs
                     top_k_vals = torch.tensor(
                         [self.sampler_params[i]["top_k"] for i in indices],
-                        device=self._handler.device,
+                        device=device,
                         dtype=torch.long,
                     )
-                    ops_sampling = self._handler.ops.sampling  # type: ignore
+                    ops_sampling = self.service.ops.sampling  # type: ignore
                     sampled = ops_sampling.top_k_sampling_from_probs(
                         group_probs, top_k=top_k_vals
                     )
                 elif sampler_idx == 4:  # Old 3: min_p_sampling_from_probs
                     min_p_vals = torch.tensor(
                         [self.sampler_params[i]["min_p"] for i in indices],
-                        device=self._handler.device,
-                        dtype=self._handler.dtype,
+                        device=device,
+                        dtype=self.service.config.dtype,
                     )
-                    ops_sampling = self._handler.ops.sampling  # type: ignore
+                    ops_sampling = self.service.ops.sampling  # type: ignore
                     sampled = ops_sampling.min_p_sampling_from_probs(
                         group_probs, min_p=min_p_vals
                     )
                 elif sampler_idx == 5:  # Old 4: top_k_top_p_sampling_from_probs
                     top_k_vals = torch.tensor(
                         [self.sampler_params[i]["top_k"] for i in indices],
-                        device=self._handler.device,
+                        device=device,
                         dtype=torch.long,
                     )
                     top_p_vals = torch.tensor(
                         [self.sampler_params[i]["top_p"] for i in indices],
-                        device=self._handler.device,
-                        dtype=self._handler.dtype,
+                        device=device,
+                        dtype=self.service.config.dtype,
                     )
-                    ops_sampling = self._handler.ops.sampling  # type: ignore
+                    ops_sampling = self.service.ops.sampling  # type: ignore
                     fn = ops_sampling.top_k_top_p_sampling_from_probs
                     sampled = fn(group_probs, top_k=top_k_vals, top_p=top_p_vals)
                 else:
@@ -738,7 +715,7 @@ class ForwardPassBatch:
         # Distribute batched results back to individual responses
         responses = []
         cursor = 0
-        for req in self._original_reqs:
+        for req in self.requests:
             output_token_indices = req.output_token_indices or []
             num_outputs = len(output_token_indices)
             request_dists = []

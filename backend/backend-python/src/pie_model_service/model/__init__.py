@@ -26,6 +26,10 @@ class Model:
     prepare_params: Callable
     config: llama3.Config | qwen2.Config | qwen3.Config
     forward_pass: llama3.ForwardPass | qwen2.ForwardPass | qwen3.ForwardPass
+    token_embed_pass: (
+        llama3.TokenEmbedPass | qwen2.TokenEmbedPass | qwen3.TokenEmbedPass
+    )
+    pred_pass: llama3.PredictionPass | qwen2.PredictionPass | qwen3.PredictionPass
 
     def __init__(
         self,
@@ -51,14 +55,20 @@ class Model:
                 self.prepare_params = llama3.prepare_params
                 self.config = llama3.Config.from_dict(self.info["architecture"])
                 self.forward_pass = llama3.ForwardPass(self.device)
+                self.token_embed_pass = llama3.TokenEmbedPass()
+                self.pred_pass = llama3.PredictionPass()
             case "qwen2":
                 self.prepare_params = qwen2.prepare_params
                 self.config = qwen2.Config.from_dict(self.info["architecture"])
                 self.forward_pass = qwen2.ForwardPass(self.device)
+                self.token_embed_pass = qwen2.TokenEmbedPass()
+                self.pred_pass = qwen2.PredictionPass()
             case "qwen3":
                 self.prepare_params = qwen3.prepare_params
                 self.config = qwen3.Config.from_dict(self.info["architecture"])
                 self.forward_pass = qwen3.ForwardPass(self.device)
+                self.token_embed_pass = qwen3.TokenEmbedPass()
+                self.pred_pass = qwen3.PredictionPass()
 
         self._init_on_device(self.device)
 
@@ -162,7 +172,25 @@ class Model:
         self.prepare_params(params)
         self.params = params
 
-    def forward_pass(
+    def embed_tokens(
+        self,
+        token_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        return self.token_embed_pass.execute(
+            params=self.params,
+            token_ids=token_ids,
+        )
+
+    def lm_pred(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        return self.pred_pass.execute(
+            params=self.params,
+            hidden_states=hidden_states,
+        )
+
+    def forward(
         self,
         input_embeds: torch.Tensor,
         position_ids: torch.Tensor,
@@ -177,9 +205,9 @@ class Model:
         single_token_inference_mode: bool,
         # subpasses
         adapter_subpass: AdapterSubpass | None,
-    ):
+    ) -> torch.Tensor:
 
-        self.forward_pass.execute(
+        return self.forward_pass.execute(
             config=self.config,
             params=self.params,
             input_embeds=input_embeds,

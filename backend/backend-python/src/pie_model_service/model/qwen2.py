@@ -45,6 +45,7 @@ class Config:
         )
 
 
+@torch.inference_mode()
 def prepare_params(
     params: dict[str, torch.Tensor],
 ):
@@ -86,6 +87,39 @@ def prepare_params(
         params[f"{prefix}.mlp.gate_up_proj.weight"] = torch.cat([gate, up], dim=0)
 
         # Qwen2 MLP does not use bias, so no bias fusion is needed here.
+
+
+class TokenEmbedPass:
+
+    def __init__(self): ...
+
+    @torch.inference_mode()
+    def execute(
+        self,
+        params: dict[str, torch.Tensor],
+        token_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        return fun.embedding(
+            input=token_ids,
+            weight=params["model.embed_tokens.weight"],
+            padding_idx=0,
+        )
+
+
+class PredictionPass:
+
+    def __init__(self): ...
+
+    @torch.inference_mode()
+    def execute(
+        self,
+        params: dict[str, torch.Tensor],
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        return fun.linear(
+            input=hidden_states,
+            weight=params["model.embed_tokens.weight"],
+        )
 
 
 class ForwardPass:
