@@ -186,36 +186,33 @@ using namespace metal;
         original_dtype = query.dtype
 
         # Dtype validation: Metal kernels support float32 and float16 only
-        with start_profile("attn_dtype_validation"):
-            if query.dtype not in [torch.float32, torch.float16]:
-                raise ValueError(
-                    f"Unsupported dtype {query.dtype} for Metal attention kernel. "
-                    f"Supported: float32, float16. Use dtype='float16' in config."
-                )
+        if query.dtype not in [torch.float32, torch.float16]:
+            raise ValueError(
+                f"Unsupported dtype {query.dtype} for Metal attention kernel. "
+                f"Supported: float32, float16. Use dtype='float16' in config."
+            )
 
-            # Ensure tensors are on MPS device
-            query = query.to("mps") if query.device.type != "mps" else query
-            kv_cache = kv_cache.to("mps") if kv_cache.device.type != "mps" else kv_cache
+        # Ensure tensors are on MPS device
+        query = query.to("mps") if query.device.type != "mps" else query
+        kv_cache = kv_cache.to("mps") if kv_cache.device.type != "mps" else kv_cache
 
         # Get dimensions
-        with start_profile("attn_buffer_prep"):
-            num_tokens, num_heads, head_dim = query.shape
-            # Kernel expects 1D output buffer, we'll reshape it later
-            output = torch.empty(
-                num_tokens * num_heads * head_dim, device="mps", dtype=query.dtype
-            )
+        num_tokens, num_heads, head_dim = query.shape
+        # Kernel expects 1D output buffer, we'll reshape it later
+        output = torch.empty(
+            num_tokens * num_heads * head_dim, device="mps", dtype=query.dtype
+        )
 
         # Run the attention kernel
-        with start_profile("attn_kernel_dispatch"):
-            result = self._run_full_attention(
-                query,
-                kv_cache,
-                kv_page_indices,
-                kv_page_indptr,
-                kv_last_page_lens,
-                qo_indptr,
-                output,
-            )
+        result = self._run_full_attention(
+            query,
+            kv_cache,
+            kv_page_indices,
+            kv_page_indptr,
+            kv_last_page_lens,
+            qo_indptr,
+            output,
+        )
 
         # Convert back to original dtype if needed
         if original_dtype != result.dtype:
@@ -357,28 +354,26 @@ using namespace metal;
             qo_indptr, kv_page_indptr, kv_page_indices, kv_last_page_lens
         )
 
-        with start_profile("attn_params_setup"):
-            # Extract dimensions
-            num_tokens, num_heads, head_dim = query.shape
-            _num_pages, _, page_size, num_kv_heads, _ = kv_cache.shape
-            scale = 1.0 / (head_dim**0.5)
+        # Extract dimensions
+        num_tokens, num_heads, head_dim = query.shape
+        _num_pages, _, page_size, num_kv_heads, _ = kv_cache.shape
+        scale = 1.0 / (head_dim**0.5)
 
-            # Create the Params struct exactly as expected by the Metal kernel
-            # This matches what the test uses: 8 parameters
-            params_data = [
-                num_tokens,  # num_qo (seq_len in test)
-                num_heads * head_dim,  # head_dim (total_head_dim in test)
-                num_kv_heads
-                * head_dim,  # kv_head_dim (total KV head dim for GQA support)
-                head_dim,  # head_size
-                page_size,  # page_size
-                num_heads,  # num_query_heads
-                num_kv_heads,  # num_kv_heads (actual KV heads from cache)
-                scale,  # scale (1/sqrt(head_dim))
-            ]
+        # Create the Params struct exactly as expected by the Metal kernel
+        # This matches what the test uses: 8 parameters
+        params_data = [
+            num_tokens,  # num_qo (seq_len in test)
+            num_heads * head_dim,  # head_dim (total_head_dim in test)
+            num_kv_heads * head_dim,  # kv_head_dim (total KV head dim for GQA support)
+            head_dim,  # head_size
+            page_size,  # page_size
+            num_heads,  # num_query_heads
+            num_kv_heads,  # num_kv_heads (actual KV heads from cache)
+            scale,  # scale (1/sqrt(head_dim))
+        ]
 
-            # Convert to Metal-compatible parameter buffer
-            params = torch.tensor(params_data, dtype=torch.float32, device="mps")
+        # Convert to Metal-compatible parameter buffer
+        params = torch.tensor(params_data, dtype=torch.float32, device="mps")
 
         # Prepare tensors in the exact format expected by the kernel
         # - Pass unified KV cache as single buffer (no copying)

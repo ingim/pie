@@ -24,7 +24,7 @@ class BaseShaderCompiler:
             page_size: KV cache page size for BLOCK_SIZE compilation (default: 16)
         """
         self.compiled_libraries: Dict[str, Any] = {}
-        self.kernel_dir = Path(__file__).parent / "metal" / "kernels"
+        self.kernel_dir = Path(__file__).parent / "kernels"
         self.page_size = page_size
 
     def can_use_mps_kernels(self) -> bool:

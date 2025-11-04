@@ -629,9 +629,6 @@ def append_paged_kv_cache(
         )
         return
 
-    # Import profiler for detailed timing
-    from profiler import start_profile  # pylint: disable=import-outside-toplevel
-
     try:
         # Try to use Metal append_kv_cache kernel via MPSShaderCompiler
         compiler = get_mps_compiler()
@@ -639,18 +636,17 @@ def append_paged_kv_cache(
             compiler.can_use_mps_kernels()
             and "append_kv_cache" in compiler.compiled_libraries
         ):
-            with start_profile("append_kv_input_reshape"):
-                # Extract dimensions
-                num_tokens, num_kv_heads, head_dim = append_key.shape
+            # Extract dimensions
+            num_tokens, num_kv_heads, head_dim = append_key.shape
 
-                # Reshape inputs for Metal kernel
-                # Metal expects [num_tokens, num_kv_heads * head_dim] for key/value
-                k_flat = append_key.contiguous().reshape(
-                    num_tokens, num_kv_heads * head_dim
-                )
-                v_flat = append_value.contiguous().reshape(
-                    num_tokens, num_kv_heads * head_dim
-                )
+            # Reshape inputs for Metal kernel
+            # Metal expects [num_tokens, num_kv_heads * head_dim] for key/value
+            k_flat = append_key.contiguous().reshape(
+                num_tokens, num_kv_heads * head_dim
+            )
+            v_flat = append_value.contiguous().reshape(
+                num_tokens, num_kv_heads * head_dim
+            )
 
             # OPTIMIZATION: Pass unified KV cache buffer (same as attention kernel)
             # Layout: [num_pages, 2, page_size, num_kv_heads, head_dim]
@@ -660,24 +656,22 @@ def append_paged_kv_cache(
             # Extract shape info BEFORE flattening (needed by compiler)
             _num_pages, _, page_size, _, _ = paged_kv_cache.shape
 
-            with start_profile("append_kv_prepare_unified"):
-                # Flatten entire unified cache (no copy - just a view!)
-                paged_kv_unified = paged_kv_cache.view(-1)
+            # Flatten entire unified cache (no copy - just a view!)
+            paged_kv_unified = paged_kv_cache.view(-1)
 
-            with start_profile("append_kv_metal_kernel"):
-                compiler.run_append_paged_kv_cache_mps(
-                    k_flat,
-                    v_flat,
-                    paged_kv_unified,
-                    batch_indices,
-                    positions,
-                    kv_indices,
-                    kv_indptr,
-                    kv_last_page_len,
-                    num_kv_heads=num_kv_heads,
-                    head_size=head_dim,
-                    page_size=page_size,
-                )
+            compiler.run_append_paged_kv_cache_mps(
+                k_flat,
+                v_flat,
+                paged_kv_unified,
+                batch_indices,
+                positions,
+                kv_indices,
+                kv_indptr,
+                kv_last_page_len,
+                num_kv_heads=num_kv_heads,
+                head_size=head_dim,
+                page_size=page_size,
+            )
 
             # No copy needed! Kernel wrote directly to unified cache with proper offsets
             return
