@@ -1,26 +1,13 @@
-"""
-Python Backend Handler
-
-This module provides the backend handler for the Python backend.
-Directly imports operations from flashinfer or pie_metal based on platform.
-Both backends now provide identical APIs.
-"""
-
 from __future__ import annotations
-
-import time
-from contextlib import contextmanager, nullcontext
 from pathlib import Path
-
 import numpy as np
 import torch
+from dataclasses import dataclass, asdict
 
-import message
+from . import message
 from .adapter import AdapterSubpass
 from .model import Model
-from .utils import is_apple_silicon
-from dataclasses import dataclass, asdict
-from .utils import resolve_cache_dir, terminate
+from .utils import resolve_cache_dir, is_apple_silicon
 
 # Direct import of backend operations based on platform
 # metal_kernels now provides the same API structure as flashinfer

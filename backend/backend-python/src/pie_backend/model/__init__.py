@@ -4,15 +4,14 @@ import base64
 import tomllib
 from pathlib import Path
 from typing import Callable
+from tqdm import tqdm
 import torch
 import ztensor
-from tqdm import tqdm
-import llama3
-import qwen2
-import qwen3
 import safetensors
-
-from src.pie_model_service.adapter import AdapterSubpass
+from . import llama3
+from . import qwen2
+from . import qwen3
+from ..adapter import AdapterSubpass
 
 
 class Model:

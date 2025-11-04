@@ -1,6 +1,6 @@
 [project]
-name = "pie-model-service"
-version = "0.1.0"
+name = "pie-backend"
+version = "0.2.0"
 description = "Pie Backend"
 authors = [{ name = "Pie Team" }]
 license = "Apache-2.0"
@@ -23,50 +23,23 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# CUDA support - Linux only (flashinfer requires CUDA-capable hardware)
 cuda = [
     "flashinfer-python>=0.3.1",
 ]
-
-# macOS-specific dependencies for Metal backend debugging
 metal = [
-    # Core PyObjC for Objective-C bridge (more stable than full PyObjC suite)
     "pyobjc-core>=10.0,<11.0",
-    # Essential Metal framework bindings only
     "pyobjc-framework-Metal>=10.0,<11.0",
     "pyobjc-framework-MetalKit>=10.0,<11.0",
     "pyobjc-framework-Cocoa>=10.0,<11.0",
 ]
 
-# Debug framework dependencies - cross-platform
-debug = [
-    # Development Tools - Code quality and type safety (additional to core)
-    "mypy>=1.5.0,<2.0.0",
-    # Plugin Bindings - Multi-language support
-    "pybind11~=3.0",
-    # Testing Framework - TDD Approach
-    "pytest~=8.4.2",
-    "pytest-asyncio~=1.1.0",
-    "pytest-cov~=7.0.0",
-    "pytest-mock>=3.11.0,<4.0.0",
-    # Type Extensions
-    "typing-extensions~=4.15.0",
-    # Performance monitoring
-    "psutil>=5.8.0",
-    # Scientific computing
-    "scipy>=1.9.0",
-]
+[tool.setuptools]
+package-dir = { "" = "src" }
 
 [tool.setuptools.packages.find]
-where = ["."]
-include = ["*"]
-exclude = ["tests*", "*.tests*"]
+where = ["src"]
 
 [tool.setuptools.package-data]
-"*" = ["*.sql", "*.toml", "*.yaml", "*.yml"]
-metal_kernels = [
-    "_internal/metal/kernels/*.metal",
-    "_internal/metal/bindings/*.mm",
-    "_internal/metal/bindings/*.h",
-    "_internal/metal/build/lib/*.metallib",
+flashinfer_metal = [
+    "kernels/*.metal",
 ]

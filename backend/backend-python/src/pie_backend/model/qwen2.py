@@ -6,8 +6,8 @@ from typing import Optional
 import torch
 import torch.nn.functional as fun
 
-from src.pie_model_service.adapter import AdapterSubpass
-from src.pie_model_service.utils import is_apple_silicon
+from ..adapter import AdapterSubpass
+from ..utils import is_apple_silicon
 
 if is_apple_silicon():
     import flashinfer_metal as ops  # type: ignore[import-not-found]

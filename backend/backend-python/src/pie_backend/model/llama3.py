@@ -6,8 +6,8 @@ from typing import Optional
 import torch
 import torch.nn.functional as fun
 
-from src.pie_model_service.adapter import AdapterSubpass
-from src.pie_model_service.utils import is_apple_silicon
+from ..adapter import AdapterSubpass
+from ..utils import is_apple_silicon
 
 if is_apple_silicon():
     import flashinfer_metal as ops  # type: ignore[import-not-found]
@@ -205,7 +205,7 @@ class ForwardPass:
             # Save input for the first residual connection
             residual = hidden_states
 
-            # 1. Input RMSNorm
+            # 1. Input RMSNorm -> can be free-cost scatter ops!
             normed_input = fun.rms_norm(
                 hidden_states,
                 normalized_shape=[config.hidden_size],
