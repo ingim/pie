@@ -85,17 +85,6 @@ class ServiceConfig:
             enable_profiling=enable_profiling,
         )
 
-    def print(self) -> None:
-        """
-        Utility to print configuration in a consistent format.
-        This replaces the original `print_config` function.
-        """
-        print("--- Configuration ---")
-        # asdict() conveniently converts the dataclass to a dict
-        for key, value in asdict(self).items():
-            print(f"{key}: {value}")
-        print("----------------------")
-
 
 class Service:
     """Python backend handler using platform-appropriate operations."""
@@ -120,7 +109,7 @@ class Service:
         )
 
         self.embeds = torch.empty(
-            (config.max_num_embeds, self.model.config.hidden_size),
+            (config.max_num_embeds, self.model.spec.dim_hidden),
             device=config.device,
             dtype=config.dtype,
         )
@@ -131,7 +120,7 @@ class Service:
                     (
                         config.max_num_adapters,
                         config.max_adapter_rank * 3,
-                        self.model.config.hidden_size,
+                        self.model.spec.dim_hidden,
                     ),
                     dtype=config.dtype,
                     device=config.device,
@@ -139,10 +128,10 @@ class Service:
                 torch.zeros(
                     (
                         config.max_num_adapters,
-                        self.model.config.head_size
+                        self.model.spec.dim_head
                         * (
-                            self.model.config.num_query_heads
-                            + self.model.config.num_key_value_heads * 2
+                            self.model.spec.num_q_heads
+                            + self.model.spec.num_kv_heads * 2
                         ),
                         config.max_adapter_rank,
                     ),
@@ -150,7 +139,7 @@ class Service:
                     device=config.device,
                 ),
             )
-            for _ in range(self.model.config.num_layers)
+            for _ in range(self.model.spec.num_layers)
         ]
 
         # Automatically decide max_num_kv_pages based on the current memory availability
@@ -179,9 +168,9 @@ class Service:
                 / (
                     config.kv_page_size
                     * 2
-                    * self.model.config.num_key_value_heads
-                    * self.model.config.head_size
-                    * self.model.config.num_layers
+                    * self.model.spec.num_kv_heads
+                    * self.model.spec.dim_head
+                    * self.model.spec.num_layers
                     * config.dtype.itemsize
                 )
             )
@@ -204,13 +193,13 @@ class Service:
                     config.max_num_kv_pages,
                     2,
                     config.kv_page_size,
-                    self.model.config.num_key_value_heads,
-                    self.model.config.head_size,
+                    self.model.spec.num_kv_heads,
+                    self.model.spec.dim_head,
                 ),
                 dtype=config.dtype,
                 device=config.device,
             )
-            for _ in range(self.model.config.num_layers)
+            for _ in range(self.model.spec.num_layers)
         ]
 
     def handshake(

@@ -122,7 +122,11 @@ class ForwardPass:
     wrapper_decode: ops.BatchDecodeWithPagedKVCacheWrapper
     wrapper_append: ops.BatchPrefillWithPagedKVCacheWrapper
 
-    def __init__(self, device: torch.device):
+    device: torch.device
+    rank: int
+    world_size: int
+
+    def __init__(self, device: torch.device, rank: int, world_size: int):
         self.workspace_buffer = torch.empty(
             128 * 1024 * 1024, dtype=torch.uint8, device=device
         )
@@ -132,6 +136,9 @@ class ForwardPass:
         self.wrapper_append = ops.BatchPrefillWithPagedKVCacheWrapper(
             self.workspace_buffer, "NHD"
         )
+        self.device = device
+        self.rank = rank
+        self.world_size = world_size
 
     @torch.inference_mode()
     def execute(

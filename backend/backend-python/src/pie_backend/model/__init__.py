@@ -1,222 +1,162 @@
 from __future__ import annotations
+from dataclasses import dataclass
+from abc import ABC, abstractmethod
+from typing import Callable, Any
 
-import base64
-import tomllib
-from pathlib import Path
-from typing import Callable
-from tqdm import tqdm
 import torch
-import ztensor
-import safetensors
-from . import llama3
-from . import qwen2
-from . import qwen3
-from ..adapter import AdapterSubpass
+from torchao.quantization import (
+    Int4WeightOnlyConfig,
+    Int8WeightOnlyConfig,
+    Float8WeightOnlyConfig,
+)
 
 
-class Model:
-
-    path: Path
-    info: dict
-    type: str
-    params: dict
-    device: torch.device
-
-    prepare_params: Callable
-    config: llama3.Config | qwen2.Config | qwen3.Config
-    forward_pass: llama3.ForwardPass | qwen2.ForwardPass | qwen3.ForwardPass
-    token_embed_pass: (
-        llama3.TokenEmbedPass | qwen2.TokenEmbedPass | qwen3.TokenEmbedPass
+@dataclass
+class Config:
+    devices: list[torch.device]
+    rank: int
+    dtype: torch.dtype
+    quantization: (
+        Int4WeightOnlyConfig | Int8WeightOnlyConfig | Float8WeightOnlyConfig | None
     )
-    pred_pass: llama3.PredictionPass | qwen2.PredictionPass | qwen3.PredictionPass
 
-    def __init__(
-        self,
-        path: Path,
-        name: str,
-        device: torch.device,
-    ):
-        self.path = path
-        self.name = name
-        self.device = device
-        model_info_path = path / f"{name}.toml"
+    kv_page_size: int
+    max_dist_size: int
+    max_num_embeds: int
+    max_batch_tokens: int | None
+    max_num_adapters: int
+    max_adapter_rank: int
+    max_num_kv_pages: int | None
+    mem_utilization: float
 
-        if not model_info_path.exists():
-            raise ValueError(f'Metadata file for model "{name}" not found at: {path}')
+    @property
+    def device(self) -> torch.device:
+        return self.devices[self.rank]
 
-        with open(model_info_path, "rb") as f:
-            self.info = tomllib.load(f)
-            self.type = self.info["architecture"]["type"]
+    @property
+    def world_size(self) -> int:
+        return len(self.devices)
 
-        # get architecture-specific handlers
-        match self.type:
-            case "l4ma":
-                self.prepare_params = llama3.prepare_params
-                self.config = llama3.Config.from_dict(self.info["architecture"])
-                self.forward_pass = llama3.ForwardPass(self.device)
-                self.token_embed_pass = llama3.TokenEmbedPass()
-                self.pred_pass = llama3.PredictionPass()
-            case "qwen2":
-                self.prepare_params = qwen2.prepare_params
-                self.config = qwen2.Config.from_dict(self.info["architecture"])
-                self.forward_pass = qwen2.ForwardPass(self.device)
-                self.token_embed_pass = qwen2.TokenEmbedPass()
-                self.pred_pass = qwen2.PredictionPass()
-            case "qwen3":
-                self.prepare_params = qwen3.prepare_params
-                self.config = qwen3.Config.from_dict(self.info["architecture"])
-                self.forward_pass = qwen3.ForwardPass(self.device)
-                self.token_embed_pass = qwen3.TokenEmbedPass()
-                self.pred_pass = qwen3.PredictionPass()
+    @staticmethod
+    def _parse_dtype(dtype: str) -> torch.dtype:
+        if not hasattr(torch, dtype):
+            raise ValueError(f"Invalid torch.dtype string: '{dtype}'")
+        return getattr(torch, dtype)
 
-        self._init_on_device(self.device)
+    @staticmethod
+    def _parse_devices(devices: list[str]) -> list[torch.device]:
+        return [torch.device(d) for d in devices]
 
-    def get_metadata(self) -> dict:
-        return {
-            "name": self.info["name"],
-            "description": self.info["description"],
-            "version": self.info["version"],
-        }
+    @staticmethod
+    def _parse_quantization(q: dict[str, Any] | None):
+        if q is None:
+            return None
 
-    def get_chat_template(self) -> dict:
-        return {
-            "template_type": self.info["template"]["type"],
-            "template_content": self.info["template"]["content"],
-            "stop_tokens": self.info["template"]["stop_tokens"],
-        }
+        qtype = q.get("type")
+        if qtype is None:
+            raise ValueError("Quantization config must contain a 'type' field.")
 
-    def get_tokenizer(self) -> dict:
-        vocab_file_path = (
-            self.path / self.name / self.info["tokenizer"]["vocabulary_file"]
-        )
-        merge_rules: dict[int, bytes] = {}
+        match qtype.lower():
+            case "int4":
+                valid_group_sizes = {256, 128, 64, 32}
+                valid_algorithms = {"tinygemm", "hqq"}
 
-        with open(vocab_file_path, "r", encoding="utf-8") as f:
-            for line_number, line in enumerate(f, 1):
-                line = line.strip()
-                # Skip empty or blank lines
-                if not line:
-                    continue
+                group_size = q.get("group_size")
+                algorithm = q.get("algorithm")
 
-                # Expect two parts: base64-encoded token and rank
-                parts = line.split()
-                if len(parts) != 2:
-                    raise ValueError(
-                        f"Error on line {line_number}: expected 2 parts, "
-                        f"but found {len(parts)} (line: '{line}')"
-                    )
+                if group_size is not None:
+                    if group_size not in valid_group_sizes:
+                        raise ValueError(
+                            f"Invalid group_size={group_size} for int4 "
+                            f"(allowed: {sorted(valid_group_sizes)})"
+                        )
 
-                b64_token, rank_str = parts
+                if algorithm is not None:
+                    if algorithm not in valid_algorithms:
+                        raise ValueError(
+                            "Invalid algorithm '{algorithm}' for int4. "
+                            f"(allowed: {sorted(valid_algorithms)})"
+                        )
 
-                # 1. Decode base64 token
-                try:
-                    decoded_token = base64.b64decode(b64_token)
-                except (ValueError, TypeError) as e:
-                    raise ValueError(
-                        f"Error on line {line_number}: failed to decode base64 token."
-                    ) from e
+                return Int4WeightOnlyConfig(
+                    group_size=group_size,
+                    int4_choose_qparams_algorithm=algorithm,
+                )
 
-                # 2. Parse rank into an integer
-                try:
-                    rank = int(rank_str)
-                except ValueError as e:
-                    raise ValueError(
-                        f"Error on line {line_number}: failed to parse "
-                        f"rank '{rank_str}' as an integer."
-                    ) from e
+            case "int8":
+                return Int8WeightOnlyConfig(
+                    group_size=q.get("group_size"),
+                )
+            case "float8":
+                return Float8WeightOnlyConfig()
+            case "none" | None:
+                return None
+            case _:
+                raise ValueError(
+                    f"Unknown quantization type '{qtype}'. "
+                    f"Expected one of: 'int4', 'int8', 'float8', 'none'"
+                )
 
-                merge_rules[rank] = decoded_token
+    @staticmethod
+    def from_dict(config: dict) -> Config:
 
-        return {
-            "type": self.info["tokenizer"]["type"],
-            "num_vocab": len(self.info["architecture"]["vocab_size"]),
-            "merge_table": merge_rules,
-            "split_regex": self.info["tokenizer"]["split_regex"],
-            "special_tokens": self.info["tokenizer"]["special_tokens"],
-            "escape_non_printable": self.info["tokenizer"]["escape_non_printable"],
-        }
+        dtype = Config._parse_dtype(config.get("dtype"))
+        devices = Config._parse_devices(config.get("devices"))
+        quantization = Config._parse_quantization(config.get("quantization"))
 
-    def _init_on_device(self, device: torch.device):
-
-        params = {}
-
-        for param_file in tqdm(
-            self.info["parameters"], desc="Scanning tensor files", unit="files"
-        ):
-
-            param_path = self.path / self.name / param_file
-
-            match param_path.suffix:
-                case "zt":
-                    with ztensor.Reader(str(param_path)) as f:
-                        for n in tqdm(
-                            f.get_tensor_names(),
-                            desc="Loading tensor parameters",
-                            unit="tensors",
-                        ):
-                            params[n] = f.read_tensor(n, to="torch").to(device)
-
-                case "safetensors":
-                    with safetensors.safe_open(
-                        str(param_path), framework="pt", device=device
-                    ) as f:
-                        for n in tqdm(
-                            f.keys(),
-                            desc="Loading tensor parameters",
-                            unit="tensors",
-                        ):
-                            params[n] = f.get_tensor(n)
-
-        # prepare params (fuse, dequantize, etc)
-        self.prepare_params(params)
-        self.params = params
-
-    def embed_tokens(
-        self,
-        token_ids: torch.Tensor,
-    ) -> torch.Tensor:
-        return self.token_embed_pass.execute(
-            params=self.params,
-            token_ids=token_ids,
+        return Config(
+            devices=devices,
+            rank=config["rank"],
+            dtype=dtype,
+            quantization=quantization,
+            kv_page_size=config["kv_page_size"],
+            max_dist_size=config["max_dist_size"],
+            max_num_embeds=config["max_num_embeds"],
+            max_batch_tokens=config.get("max_batch_tokens"),
+            max_num_adapters=config["max_num_adapters"],
+            max_adapter_rank=config["max_adapter_rank"],
+            max_num_kv_pages=config.get("max_num_kv_pages"),
+            mem_utilization=config["mem_utilization"],
         )
 
-    def lm_pred(
-        self,
-        hidden_states: torch.Tensor,
-    ) -> torch.Tensor:
-        return self.pred_pass.execute(
-            params=self.params,
-            hidden_states=hidden_states,
-        )
 
-    def forward(
-        self,
-        input_embeds: torch.Tensor,
-        position_ids: torch.Tensor,
-        qo_indptr: torch.Tensor,
-        # kv cache
-        kv_cache_at_layer: list[torch.Tensor],
-        kv_page_indices: torch.Tensor,
-        kv_page_indptr: torch.Tensor,
-        kv_last_page_lens: torch.Tensor,
-        # mask
-        custom_mask: torch.Tensor | None,
-        single_token_inference_mode: bool,
-        # subpasses
-        adapter_subpass: AdapterSubpass | None,
-    ) -> torch.Tensor:
+# Model architecture specification
+@dataclass
+class Spec(ABC):
 
-        return self.forward_pass.execute(
-            config=self.config,
-            params=self.params,
-            input_embeds=input_embeds,
-            position_ids=position_ids,
-            qo_indptr=qo_indptr,
-            kv_cache_at_layer=kv_cache_at_layer,
-            kv_page_indices=kv_page_indices,
-            kv_page_indptr=kv_page_indptr,
-            kv_last_page_lens=kv_last_page_lens,
-            custom_mask=custom_mask,
-            single_token_inference_mode=single_token_inference_mode,
-            adapter_subpass=adapter_subpass,
-        )
+    @staticmethod
+    @abstractmethod
+    def from_dict(spec: dict) -> Spec:
+        """Construct a Spec object from a configuration dictionary."""
+        pass
+
+
+@dataclass
+class Param(ABC):
+    spec: Spec
+    config: Config
+
+    @staticmethod
+    @abstractmethod
+    def from_reader(
+        spec: Spec,
+        config: Config,
+        read: Callable[..., torch.Tensor],
+    ) -> Param:
+        """Create a Param-like object from a tensor reader and spec."""
+        pass
+
+
+@dataclass
+class Buffer(ABC):
+    spec: Spec
+    config: Config
+
+    @staticmethod
+    @abstractmethod
+    def from_config(
+        spec: Spec,
+        config: Config,
+    ) -> Buffer:
+        """Create a Param-like object from a tensor reader and spec."""
+        pass
